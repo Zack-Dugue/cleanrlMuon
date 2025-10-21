@@ -1,0 +1,20 @@
+Here's the plan:
+
+We want to evaluate Muon for RL. We'll be comparing
+*SGD
+*Adam
+*Muon
+*AdaMuon
+
+We're gonna compare across the whole Atari Suite. Doing HPO on a subset of games, and then evaluating on the rest.
+Since larger models are where
+
+For algorithms we'll evaluate using:
+* PPO
+* SAC
+* DQN
+
+For PPO we'll tune:
+    * LR
+    *
+

@@ -12,6 +12,8 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+from optimizers import AdaMuonWithAuxAdam , MuonWithAuxAdam
+
 
 from cleanrl_utils.atari_wrappers import (  # isort:skip
     ClipRewardEnv,
@@ -38,7 +40,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
@@ -76,6 +78,12 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+    # Optimizer stuff
+    optimizer: str = "Adam"
+    momentum: float = .9
+
+
+
 
     # to be filled in runtime
     batch_size: int = 0
@@ -114,27 +122,50 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
+import torch
+import torch.nn as nn
+
+# assumes you already have this helper
+# def layer_init(module, std=np.sqrt(2), bias_const=0.0): ...
+
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
+        # Input (B, 4, 84, 84)
+        self.embed = layer_init(nn.Conv2d(4, 32, kernel_size=8, stride=4))  # -> (B, 32, 20, 20)
+
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
             nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2)),          # -> (B, 64, 9, 9)
             nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            layer_init(nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)),  # keep (B, 128, 9, 9)
             nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, 512)),
+            layer_init(nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)), # -> (B, 256, 5, 5)
+            nn.ReLU(),
+
+            # Preserve coarse spatial info: pool to a 4x4 grid (keeps positions like health bars)
+            nn.AdaptiveAvgPool2d(4),                                         # -> (B, 256, 4, 4)
+
+            # Compress channels so flattened feature is 256 (=16*4*4)
+            layer_init(nn.Conv2d(256, 16, kernel_size=1, stride=1)),         # -> (B, 16, 4, 4)
+            nn.ReLU(),
+            nn.Flatten(),                                                    # -> (B, 16*4*4=256)
+
+            # Square MLP head (Muon-friendly)
+            layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
-        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1)
+
+        self.actor  = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(256, 1), std=1.0)
+
 
     def get_value(self, x):
+        x = self.embed(x)
         return self.critic(self.network(x / 255.0))
 
     def get_action_and_value(self, x, action=None):
+        x = self.embed(x)
         hidden = self.network(x / 255.0)
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
@@ -182,8 +213,24 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-
+    if args.optimizer == 'SGD':
+        optimizer = optim.SGD(agent.parameters(), momentum = args.momentum, lr=args.learning_rate)
+    elif args.optimizer == 'Adam':
+        optimizer = optim.Adam(agent.parameters(),  betas = (args.momentum,.999), lr=args.learning_rate, eps=1e-5)
+    elif args.optimizer == 'Muon':
+        hidden_weights = [p for p in agent.network.parameters() if p.ndim >= 2]
+        hidden_gains_biases = [p for p in agent.network.parameters() if p.ndim < 2]
+        nonhidden_params = [*agent.actor.parameters(), *agent.critic.parameters(), *agent.embed.parameters()]
+        param_groups = [dict(params=hidden_weights, lr = args.learning_rate, momentum = args.momentum, weight_decay = .0001,use_muon=True),
+                        dict(params=hidden_gains_biases + nonhidden_params, lr = args.learning_rate,momentum=args.momentum, weight_decay = .0001 ,use_muon=False) ]
+        optimizer = MuonWithAuxAdam(param_groups)
+    elif args.optimizer == 'AdaMuon':
+        hidden_weights = [p for p in agent.network.parameters() if p.ndim >= 2]
+        hidden_gains_biases = [p for p in agent.network.parameters() if p.ndim < 2]
+        nonhidden_params = [*agent.actor.parameters(), *agent.critic.parameters(), *agent.embed.parameters()]
+        param_groups = [dict(params=hidden_weights, lr = args.learning_rate, weight_decay = .0001,use_muon=True),
+                        dict(params=hidden_gains_biases + nonhidden_params, lr = args.learning_rate, weight_decay = .0001 ,use_muon=False) ]
+        optimizer = AdaMuonWithAuxAdam(param_groups)
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -326,4 +373,4 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     envs.close()
-    writer.close()
+    writer.close() 
