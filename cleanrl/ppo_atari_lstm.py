@@ -1,375 +1,428 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_atari_lstmpy
-import os
-import random
-import time
-from dataclasses import dataclass
+# -*- coding: utf-8 -*-
+import json, os, sys, subprocess, shlex, multiprocessing as mp
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-import gymnasium as gym
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import tyro
-from torch.distributions.categorical import Categorical
-from torch.utils.tensorboard import SummaryWriter
+import optuna
+from optuna.trial import TrialState
+from cleanrl_utils.tuner import Tuner
 
-from cleanrl_utils.atari_wrappers import (  # isort:skip
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-)
+# ---- Path to your CleanRL PPO script (Gym v0.26 “NoFrameskip-v4” IDs) ----
+CLEANRL_PPO = r"C:\Users\dugue\PycharmProjects\cleanrlMuon\cleanrl\ppo_atari.py"
 
+# -----------------------------
+# Tuning set (20 games)
+# -----------------------------
+TARGET_SCORES_TUNE: Dict[str, Tuple[float, float]] = {
+    "AlienNoFrameskip-v4": (227.75, 7127.7),
+    "AmidarNoFrameskip-v4": (5.77, 1719.5),
+    "AssaultNoFrameskip-v4": (222.39, 742.0),
+    "AsterixNoFrameskip-v4": (210.0, 8503.3),
+    "BoxingNoFrameskip-v4": (0.05, 12.1),
+    "BreakoutNoFrameskip-v4": (1.72, 30.5),
+    "CentipedeNoFrameskip-v4": (2090.87, 12017.0),
+    "DemonAttackNoFrameskip-v4": (152.07, 1971.0),
+    "EnduroNoFrameskip-v4": (0.0, 860.5),
+    "FreewayNoFrameskip-v4": (0.01, 29.6),
+    "FrostbiteNoFrameskip-v4": (65.2, 4334.7),
+    "GopherNoFrameskip-v4": (257.6, 2412.5),
+    "HeroNoFrameskip-v4": (1026.97, 30826.4),
+    "JamesbondNoFrameskip-v4": (29.0, 302.8),
+    "KangarooNoFrameskip-v4": (52.0, 3035.0),
+    "KrullNoFrameskip-v4": (1598.05, 2665.5),
+    "MsPacmanNoFrameskip-v4": (307.3, 6951.6),
+    "PongNoFrameskip-v4": (-20.71, 14.6),
+    "SeaquestNoFrameskip-v4": (68.4, 42054.7),
+    "SpaceInvadersNoFrameskip-v4": (148.3, 1668.7),
+}
 
-@dataclass
-class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
-    seed: int = 1
-    """seed of the experiment"""
-    torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
-    track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
-    wandb_entity: str = None
-    """the entity (team) of wandb's project"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
+# -----------------------------
+# Evaluation set (37 games)
+# -----------------------------
+TARGET_SCORES_EVAL: Dict[str, Tuple[float, float]] = {
+    "AsteroidsNoFrameskip-v4": (719.1, 47388.7),
+    "AtlantisNoFrameskip-v4": (12850.0, 29028.1),
+    "BankHeistNoFrameskip-v4": (14.2, 753.1),
+    "BattleZoneNoFrameskip-v4": (2360.0, 37187.5),
+    "BeamRiderNoFrameskip-v4": (363.88, 16926.5),
+    "BerzerkNoFrameskip-v4": (123.65, 2630.4),
+    "BowlingNoFrameskip-v4": (23.11, 160.7),
+    "ChopperCommandNoFrameskip-v4": (811.0, 7387.8),
+    "CrazyClimberNoFrameskip-v4": (10780.5, 35829.4),
+    "DefenderNoFrameskip-v4": (2874.5, 18688.9),
+    "DoubleDunkNoFrameskip-v4": (-18.55, -16.4),
+    "FishingDerbyNoFrameskip-v4": (-91.71, -38.7),
+    "GravitarNoFrameskip-v4": (173.0, 3351.4),
+    "IceHockeyNoFrameskip-v4": (-11.15, 0.9),
+    "KungFuMasterNoFrameskip-v4": (258.5, 22736.3),
+    "MontezumaRevengeNoFrameskip-v4": (0.0, 4753.3),
+    "NameThisGameNoFrameskip-v4": (2292.35, 8049.0),
+    "PhoenixNoFrameskip-v4": (761.4, 7242.6),
+    "PitfallNoFrameskip-v4": (-229.44, 6463.7),
+    "PrivateEyeNoFrameskip-v4": (24.94, 69571.3),
+    "QbertNoFrameskip-v4": (163.88, 13455.0),
+    "RiverraidNoFrameskip-v4": (1338.5, 17118.0),
+    "RoadRunnerNoFrameskip-v4": (11.5, 7845.0),
+    "RobotankNoFrameskip-v4": (2.16, 11.9),
+    "SkiingNoFrameskip-v4": (-17098.09, -4336.9),
+    "SolarisNoFrameskip-v4": (1236.3, 12326.7),
+    "StarGunnerNoFrameskip-v4": (664.0, 10250.0),
+    "SurroundNoFrameskip-v4": (-9.99, 6.53),
+    "TennisNoFrameskip-v4": (-23.84, -8.3),
+    "TimePilotNoFrameskip-v4": (3568.0, 5229.2),
+    "TutankhamNoFrameskip-v4": (11.43, 167.6),
+    "UpNDownNoFrameskip-v4": (533.4, 11693.2),
+    "VentureNoFrameskip-v4": (0.0, 1187.5),
+    "VideoPinballNoFrameskip-v4": (0.0, 17667.9),
+    "WizardOfWorNoFrameskip-v4": (563.5, 4756.5),
+    "YarsRevengeNoFrameskip-v4": (3092.91, 54576.9),
+    "ZaxxonNoFrameskip-v4": (32.5, 9173.3),
+}
 
-    # Algorithm specific arguments
-    env_id: str = "BreakoutNoFrameskip-v4"
-    """the id of the environment"""
-    total_timesteps: int = 10000000
-    """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
-    """the learning rate of the optimizer"""
-    num_envs: int = 8
-    """the number of parallel game environments"""
-    num_steps: int = 128
-    """the number of steps to run in each environment per policy rollout"""
-    anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99
-    """the discount factor gamma"""
-    gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
-    num_minibatches: int = 4
-    """the number of mini-batches"""
-    update_epochs: int = 4
-    """the K epochs to update the policy"""
-    norm_adv: bool = True
-    """Toggles advantages normalization"""
-    clip_coef: float = 0.1
-    """the surrogate clipping coefficient"""
-    clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
-    """coefficient of the entropy"""
-    vf_coef: float = 0.5
-    """coefficient of the value function"""
-    max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
-    target_kl: float = None
-    """the target KL divergence threshold"""
+# -----------------------------
+# Search space (tunes momentum too)
+# -----------------------------
+def default_params_fn(trial: optuna.Trial) -> dict:
+    return {
+        "learning-rate": trial.suggest_float("lr", 3e-5, 3e-3, log=True),
+        "ent-coef": trial.suggest_float("ent_coef", 0.0, 0.02),
+        "update-epochs": trial.suggest_int("update_epochs", 2, 8),
+        "momentum": trial.suggest_float("momentum", 0.5, 0.99),  # used as SGD momentum or Adam β1
+        "num-envs": 32,
+        "num-steps": 256,            # total batch: 8192
+        "total-timesteps": 5_000_000,
+        # add "optimizer": "Adam"/"Muon"/"AdaMuon" here if you want to lock it
+    }
 
-    # to be filled in runtime
-    batch_size: int = 0
-    """the batch size (computed in runtime)"""
-    minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
-    num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
+# -----------------------------
+# Logging helpers
+# -----------------------------
+def mkdir_p(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True); return p
 
-
-def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 1)
-        return env
-
-    return thunk
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
-class Agent(nn.Module):
-    def __init__(self, envs):
-        super().__init__()
-        self.network = nn.Sequential(
-            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-            nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, 512)),
-            nn.ReLU(),
+def run_cmd(cmd: List[str], env: dict, log_file: Path, timeout: int | None = None) -> tuple[int, str, str]:
+    """Run a subprocess with UTF-8 decoding and line-buffered logging (Windows-safe)."""
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write(f"\n=== RUN: {' '.join(shlex.quote(c) for c in cmd)} ===\n")
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,                # line-buffered
+            encoding="utf-8",
+            errors="replace",         # NEVER crash on odd bytes (Windows code pages)
         )
-        self.lstm = nn.LSTM(512, 128)
-        for name, param in self.lstm.named_parameters():
-            if "bias" in name:
-                nn.init.constant_(param, 0)
-            elif "weight" in name:
-                nn.init.orthogonal_(param, 1.0)
-        self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(128, 1), std=1)
+        out_lines, err_lines = [], []
+        # stream stdout
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                f.write(line); out_lines.append(line)
+        # stream stderr
+        if proc.stderr is not None:
+            for line in proc.stderr:
+                f.write(line); err_lines.append(line)
+        ret = proc.wait(timeout=timeout)
+        return ret, "".join(out_lines), "".join(err_lines)
 
-    def get_states(self, x, lstm_state, done):
-        hidden = self.network(x / 255.0)
+# -----------------------------
+# Preflight: fail-fast diagnostics
+# -----------------------------
+def preflight_envs(env_ids: List[str], env: dict, logs_dir: Path, ppo_script: str) -> None:
+    """1) Try gym.make for each v4 env; 2) run a 16-step PPO dry run (no W&B)."""
+    log_envs = mkdir_p(logs_dir) / "preflight_envs.log"
 
-        # LSTM logic
-        batch_size = lstm_state[0].shape[1]
-        hidden = hidden.reshape((-1, batch_size, self.lstm.input_size))
-        done = done.reshape((-1, batch_size))
-        new_hidden = []
-        for h, d in zip(hidden, done):
-            h, lstm_state = self.lstm(
-                h.unsqueeze(0),
-                (
-                    (1.0 - d).view(1, -1, 1) * lstm_state[0],
-                    (1.0 - d).view(1, -1, 1) * lstm_state[1],
-                ),
-            )
-            new_hidden += [h]
-        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
-        return new_hidden, lstm_state
+    # 1) Env creation smoke test (Gym v0.26 ALE stack)
+    check_code = (
+        "import sys,gym\n"
+        "ids=sys.argv[1:]\n"
+        "ok=True\n"
+        "for i in ids:\n"
+        "  try:\n"
+        "    gym.make(i).close(); print('OK', i)\n"
+        "  except Exception as e:\n"
+        "    ok=False; print('FAIL', i, e)\n"
+        "sys.exit(0 if ok else 2)\n"
+    )
+    cmd = [sys.executable, "-c", check_code, *env_ids]
+    ret, _, _ = run_cmd(cmd, env, log_envs)
+    if ret != 0:
+        raise RuntimeError(
+            "Preflight FAILED: cannot create one or more Atari environments.\n"
+            "Check ROMs and gym/ale-py install. See: "
+            f"{log_envs}"
+        )
 
-    def get_value(self, x, lstm_state, done):
-        hidden, _ = self.get_states(x, lstm_state, done)
-        return self.critic(hidden)
+    # 2) PPO dry run (tiny) for the first env id; catches CLI mismatches fast
+    dry_env = env_ids[0]
+    dry_cmd = [
+        sys.executable, ppo_script,
+        "--env-id", dry_env,
+        "--total-timesteps", "16",
+        "--num-envs", "2",
+        "--num-steps", "8",
+        "--track", "False",
+    ]
+    ret, out, err = run_cmd(dry_cmd, env, logs_dir / "preflight_dryrun.log", timeout=300)
+    if ret != 0:
+        lines = (err or out).splitlines()[:20]
+        raise RuntimeError(
+            "Preflight FAILED: PPO script cannot start with tiny settings.\n"
+            "Common causes: unrecognized CLI flags, missing deps, wrong env IDs.\n"
+            "First error lines:\n  " + "\n  ".join(lines) +
+            f"\nSee log: {logs_dir / 'preflight_dryrun.log'}"
+        )
 
-    def get_action_and_value(self, x, lstm_state, done, action=None):
-        hidden, lstm_state = self.get_states(x, lstm_state, done)
-        logits = self.actor(hidden)
-        probs = Categorical(logits=logits)
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), lstm_state
+# -----------------------------
+# W&B + threading env (UTF-8 enforced)
+# -----------------------------
+def prepare_env_for_worker(
+    enable_wandb: bool,
+    project: str,
+    entity: str | None,
+    cpu_ids: List[int] | None
+) -> dict:
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"         # real-time logs on SLURM/Windows
+    # ---- FORCE UTF-8 EVERYWHERE (Windows-safe) ----
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("LC_ALL", "C.UTF-8")
+    env.setdefault("LANG", "C.UTF-8")
 
+    if enable_wandb:
+        env["WANDB_PROJECT"] = project
+        if entity:
+            env["WANDB_ENTITY"] = entity
+        env["WANDB_SILENT"] = "true"
+        env["WANDB__SERVICE_WAIT"] = "300"
+    else:
+        env["WANDB_MODE"] = "disabled"
+
+    # Optional CPU affinity (Linux best-effort)
+    if cpu_ids:
+        try:
+            if hasattr(os, "sched_setaffinity"):
+                os.sched_setaffinity(0, set(cpu_ids))
+        except Exception:
+            pass
+        env.setdefault("OMP_NUM_THREADS", str(len(cpu_ids)))
+        env.setdefault("MKL_NUM_THREADS", str(len(cpu_ids)))
+    return env
+
+# -----------------------------
+# Worker
+# -----------------------------
+def _worker(
+    gpu_idx: int | None,
+    shard_envs: List[str],
+    study_name: str,
+    storage_url: str | None,
+    num_trials: int,
+    num_seeds: int,
+    metric: str,
+    metric_last_n_average_window: int,
+    direction: str,
+    aggregation_type: str,
+    params_fn,
+    wandb_enable: bool,
+    wandb_project: str,
+    wandb_entity: str | None,
+    cpu_ids: List[int] | None,
+    results_dir: str,
+):
+    logs_dir = mkdir_p(Path(results_dir) / f"logs_worker_{'gpu'+str(gpu_idx) if gpu_idx is not None else 'cpu'}")
+    worker_log = logs_dir / "worker.log"
+
+    # Optuna verbosity
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+
+    env = prepare_env_for_worker(wandb_enable, wandb_project, wandb_entity, cpu_ids)
+    if gpu_idx is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+
+    # ---- Preflight (fail fast with actionable errors) ----
+    try:
+        preflight_envs(shard_envs, env, logs_dir, CLEANRL_PPO)
+    except Exception as e:
+        msg = f"[preflight] {e}"
+        worker_log.write_text(msg, encoding="utf-8")
+        print(msg, flush=True)
+        # Write an empty best shard file so the parent can proceed
+        Path(results_dir).mkdir(parents=True, exist_ok=True)
+        with open(Path(results_dir)/f"best_{'gpu'+str(gpu_idx) if gpu_idx is not None else 'cpu'}.json","w",encoding="utf-8") as f:
+            json.dump({"value": None, "params": {}, "error": str(e)}, f, indent=2)
+        return
+
+    # ---- Tuner setup ----
+    sampler = optuna.samplers.TPESampler(seed=0)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=3)
+    target_scores = {k: TARGET_SCORES_TUNE[k] for k in shard_envs}
+
+    tuner = Tuner(
+        script=CLEANRL_PPO,
+        metric=metric,
+        metric_last_n_average_window=metric_last_n_average_window,
+        direction=direction,
+        aggregation_type=aggregation_type,
+        target_scores=target_scores,
+        pruner=pruner,
+        sampler=sampler,
+        # If your Tuner supports shared study across workers, uncomment:
+        # storage=storage_url,
+        # study_name=f"{study_name}_gpu{gpu_idx if gpu_idx is not None else 'cpu'}",
+        params_fn=params_fn,
+    )
+
+    # Pass W&B flags into child CleanRL runs
+    def params_with_tracking(trial: optuna.Trial) -> dict:
+        p = params_fn(trial)
+        if wandb_enable:
+            p["track"] = True
+            p["wandb-project-name"] = wandb_project
+            if wandb_entity:
+                p["wandb-entity"] = wandb_entity
+        return p
+
+    tuner.params_fn = params_with_tracking  # type: ignore
+
+    # ---- Run tuning ----
+    try:
+        study = tuner.tune(num_trials=num_trials, num_seeds=num_seeds)
+    except Exception as e:
+        worker_log.write_text(f"[tuner] crashed: {e}", encoding="utf-8")
+        print(f"[tuner] crashed: {e}", flush=True)
+        study = None
+
+    # ---- Persist best trial from this shard ----
+    best = None
+    try:
+        if study is not None and hasattr(study, "trials"):
+            good = [t for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)]
+            if good:
+                bt = max(good, key=lambda t: t.value if t.value is not None else float("-inf"))
+                best = {"value": bt.value, "params": bt.params, "number": bt.number}
+    except Exception:
+        pass
+
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+    shard = f"gpu{gpu_idx}" if gpu_idx is not None else "cpu"
+    out_path = Path(results_dir) / f"best_{shard}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(best or {"value": None, "params": {}}, f, indent=2)
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def shard_evenly(items: List[str], parts: int) -> List[List[str]]:
+    if parts <= 1: return [items]
+    k, r = divmod(len(items), parts)
+    out, s = [], 0
+    for i in range(parts):
+        size = k + (1 if i < r else 0)
+        out.append(items[s:s+size]); s += size
+    return out
+
+def detect_gpus() -> int:
+    try:
+        import torch
+        return torch.cuda.device_count()
+    except Exception:
+        return 0
+
+# -----------------------------
+# Main
+# -----------------------------
+def main(
+    use_eval_set: bool = False,
+    num_trials: int = 10,
+    num_seeds: int = 3,
+    study_name: str = "ppo_atari_tune",
+    storage_url: str | None = None,
+    cpu_per_gpu: int | None = None,
+    wandb_enable: bool = True,
+    wandb_project: str = "cleanRL",
+    wandb_entity: str | None = None,
+    results_dir: str = "tuning_results",
+):
+    games_dict = (TARGET_SCORES_EVAL if use_eval_set else TARGET_SCORES_TUNE)
+    game_keys = list(games_dict.keys())
+
+    ngpu = detect_gpus()
+    shards = shard_evenly(game_keys, ngpu) if ngpu >= 2 else [game_keys]
+
+    # Optional CPU slices per shard (Linux best-effort)
+    cpu_slices: List[List[int] | None] = [None] * len(shards)
+    if ngpu >= 2:
+        try:
+            import psutil  # type: ignore
+            total = psutil.cpu_count(logical=True) or os.cpu_count() or 0
+            if total and total > 0:
+                per = cpu_per_gpu or max(1, total // ngpu)
+                for i in range(ngpu):
+                    lo, hi = i * per, min((i + 1) * per, total)
+                    cpu_slices[i] = list(range(lo, hi)) if hi > lo else None
+        except Exception:
+            pass
+
+    metric = "charts/episodic_return"
+    metric_window = 50
+    direction = "maximize"
+    aggregation_type = "median"
+
+    procs: List[mp.Process] = []
+    for idx, shard in enumerate(shards):
+        gpu_idx = (idx if ngpu >= 2 else None)
+        p = mp.Process(
+            target=_worker,
+            args=(gpu_idx, shard, study_name, storage_url, num_trials, num_seeds,
+                  metric, metric_window, direction, aggregation_type,
+                  default_params_fn, wandb_enable, wandb_project, wandb_entity,
+                  cpu_slices[idx], results_dir),
+            daemon=False,
+        )
+        p.start(); procs.append(p)
+    for p in procs: p.join()
+
+    # Collate best overall
+    best_overall = None
+    for f in Path(results_dir).glob("best_*.json"):
+        try:
+            d = json.loads(Path(f).read_text(encoding="utf-8"))
+            if d.get("value") is None: continue
+            if (best_overall is None) or (d["value"] > best_overall["value"]):
+                d["source"] = f.name; best_overall = d
+        except Exception:
+            pass
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+    out = Path(results_dir) / "best_overall.json"
+    out.write_text(json.dumps(best_overall or {"value": None, "params": {}}, indent=2), encoding="utf-8")
+    print(f"[tuner] Best overall saved to: {out.resolve()}")
 
 if __name__ == "__main__":
-    args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--use_eval_set", action="store_true")
+    ap.add_argument("--num_trials", type=int, default=10)
+    ap.add_argument("--num_seeds", type=int, default=3)
+    ap.add_argument("--study_name", type=str, default="ppo_atari_tune")
+    ap.add_argument("--storage_url", type=str, default=None)
+    ap.add_argument("--cpu_per_gpu", type=int, default=None)
+    ap.add_argument("--wandb_enable", type=lambda s: s.lower() in {"1","true","yes"}, default=True)
+    ap.add_argument("--wandb_project", type=str, default="cleanRL")
+    ap.add_argument("--wandb_entity", type=str, default=None)
+    ap.add_argument("--results_dir", type=str, default="tuning_results")
+    args = ap.parse_args()
+    main(
+        use_eval_set=args.use_eval_set,
+        num_trials=args.num_trials,
+        num_seeds=args.num_seeds,
+        study_name=args.study_name,
+        storage_url=args.storage_url,
+        cpu_per_gpu=args.cpu_per_gpu,
+        wandb_enable=args.wandb_enable,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        results_dir=args.results_dir,
     )
-
-    # TRY NOT TO MODIFY: seeding
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.torch_deterministic
-
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-
-    # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
-    )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-
-    agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-
-    # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
-
-    # TRY NOT TO MODIFY: start the game
-    global_step = 0
-    start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
-    next_lstm_state = (
-        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
-        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
-    )  # hidden and cell states (see https://youtu.be/8HyCNIVRbSU)
-
-    for iteration in range(1, args.num_iterations + 1):
-        initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
-        # Annealing the rate if instructed to do so.
-        if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
-
-        for step in range(0, args.num_steps):
-            global_step += args.num_envs
-            obs[step] = next_obs
-            dones[step] = next_done
-
-            # ALGO LOGIC: action logic
-            with torch.no_grad():
-                action, logprob, _, value, next_lstm_state = agent.get_action_and_value(next_obs, next_lstm_state, next_done)
-                values[step] = value.flatten()
-            actions[step] = action
-            logprobs[step] = logprob
-
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-            next_done = np.logical_or(terminations, truncations)
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
-
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-
-        # bootstrap value if not done
-        with torch.no_grad():
-            next_value = agent.get_value(
-                next_obs,
-                next_lstm_state,
-                next_done,
-            ).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            returns = advantages + values
-
-        # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_dones = dones.reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
-
-        # Optimizing the policy and value network
-        assert args.num_envs % args.num_minibatches == 0
-        envsperbatch = args.num_envs // args.num_minibatches
-        envinds = np.arange(args.num_envs)
-        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
-        clipfracs = []
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(envinds)
-            for start in range(0, args.num_envs, envsperbatch):
-                end = start + envsperbatch
-                mbenvinds = envinds[start:end]
-                mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
-
-                _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
-                    b_obs[mb_inds],
-                    (initial_lstm_state[0][:, mbenvinds], initial_lstm_state[1][:, mbenvinds]),
-                    b_dones[mb_inds],
-                    b_actions.long()[mb_inds],
-                )
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
-                mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
-
-            if args.target_kl is not None and approx_kl > args.target_kl:
-                break
-
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-    envs.close()
-    writer.close()
