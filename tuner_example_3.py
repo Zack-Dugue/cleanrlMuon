@@ -1,23 +1,31 @@
 # file: multi_env_tuner_atari_dp.py
 """
-Multi-GPU aware Atari tuner with:
-  • CPU / 1×GPU: single-process, logs to console.
-  • N×GPU (N>=2): shard games across GPUs, one worker per GPU, each logs to its own file.
-    - If any worker errors, print to stderr and abort all.
-  • W&B support via env + CleanRL flags.
-  • Tunes momentum (Tyro flag --momentum), plus your lr/ent_coef/update_epochs.
-  • Saves best shard results and a best_overall.json.
+Multi-GPU Atari tuner with checkpoint/resume.
 
-Requires:
-  - optuna
-  - cleanrl_utils.tuner.Tuner
-  - PyTorch for CUDA device count
-  - (optional) psutil for CPU pinning on Linux
+Features
+--------
+• CPU / 1×GPU: single-process, logs to console.
+• N×GPU (N>=2): shard games across GPUs, one worker per GPU, each logs to its own file.
+  - If any worker errors, print to stderr and abort all.
+• W&B support via env + CleanRL flags.
+• Tunes momentum (Tyro flag --momentum), plus lr/ent_coef/update_epochs.
+• Saves best shard results and a best_overall.json.
+• NEW: Checkpoint/resume using Optuna persistent storage (SQLite by default).
+  - --resume_dir to continue a previous run directory.
+  - Or pass --storage_url (e.g., sqlite:///tuning.db) to keep a stable DB across runs.
+
+Requirements
+------------
+- optuna
+- cleanrl_utils.tuner.Tuner (CleanRL)
+- PyTorch (for CUDA count)
+- (optional) psutil for CPU pinning on Linux
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -106,15 +114,12 @@ def default_params_fn(trial: optuna.Trial) -> dict:
         "learning-rate": trial.suggest_float("lr", 3e-5, 3e-3, log=True),
         "ent-coef": trial.suggest_float("ent_coef", 0.0, 0.02),
         "update-epochs": trial.suggest_int("update_epochs", 2, 8),
-        "momentum": trial.suggest_float("momentum", 0.7, 0.99),  # NEW: tunes --momentum
+        "momentum": trial.suggest_float("momentum", 0.7, 0.99),  # tunes --momentum
 
         # Fixed batch shape
         "num-envs": 32,
         "num-steps": 256,               # total batch: 8192
         "total-timesteps": 5_000_000,
-
-        # If your CleanRL script exposes optimizer choice, we leave it as default (no tuning).
-        # You can still force it here (e.g., "optimizer": "Adam") if you want.
     }
 
 # -----------------------------
@@ -140,7 +145,7 @@ def detect_gpus() -> int:
 
 def prepare_wandb_env(enable: bool, project: str, entity: str | None) -> dict:
     env = dict(os.environ)
-    # Ensure UTF-8 writes don’t crash on Windows
+    env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("PYTHONIOENCODING", "utf-8")
     if enable:
         env["WANDB_PROJECT"] = project
@@ -156,15 +161,24 @@ def set_cpu_affinity(cpu_ids: List[int] | None) -> None:
     if not cpu_ids:
         return
     try:
-        # Linux: os.sched_setaffinity
         if hasattr(os, "sched_setaffinity"):
             os.sched_setaffinity(0, set(cpu_ids))
             return
-        # Fallback: psutil
         import psutil  # type: ignore
         psutil.Process().cpu_affinity(cpu_ids)
     except Exception:
-        pass  # best-effort only
+        pass
+
+def shard_study_name(base: str, games: List[str]) -> str:
+    # Deterministic ID based on the game list (order-insensitive)
+    key = ",".join(sorted(games))
+    hid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return f"{base}_{hid}"
+
+def default_sqlite_url(run_dir: str) -> str:
+    # Use an on-disk SQLite DB inside the run directory
+    db_path = Path(run_dir) / "optuna.db"
+    return f"sqlite:///{db_path.as_posix()}"
 
 # -----------------------------
 # Per-GPU worker
@@ -184,41 +198,39 @@ def worker_entry(
     wandb_project: str,
     wandb_entity: str | None,
     cpu_ids: List[int] | None,
-    storage_url: str | None,
-    study_name: str,
+    storage_url: str,
+    base_study_name: str,
     returncode_sentinel: mp.Value,
 ):
     """
     Runs one Tuner shard. On multi-GPU, stdout/stderr are redirected to a per-shard log file.
-    On error: write to stderr (parent’s console) via print(..., file=sys.stderr, flush=True) and set returncode.
+    On error: write to stderr and set returncode sentinel.
     """
     shard = f"gpu{gpu_idx}" if gpu_idx is not None else "solo"
     shard_dir = Path(run_dir) / shard
     shard_dir.mkdir(parents=True, exist_ok=True)
     log_path = shard_dir / f"{shard}.log"
 
-    # Redirect stdout/stderr to file in multi-GPU mode; in single mode we’ll leave them untouched.
+    # Multi-gpu mode?
     multi_mode = gpu_idx is not None and os.environ.get("MULTI_GPU_MODE", "0") == "1"
 
-    # Build env: pin GPU + W&B + UTF-8
+    # Env
     env = prepare_wandb_env(wandb_enable, wandb_project, wandb_entity)
     if gpu_idx is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-    # best-effort BLAS threads ≈ number of pinned cores
     if cpu_ids:
         env.setdefault("OMP_NUM_THREADS", str(len(cpu_ids)))
         env.setdefault("MKL_NUM_THREADS", str(len(cpu_ids)))
-
-    # Apply CPU affinity
     set_cpu_affinity(cpu_ids)
 
-    # Prepare target scores for this shard
+    # Targets for this shard
     full_dict = TARGET_SCORES_EVAL if use_eval_set else TARGET_SCORES_TUNE
     target_scores = {k: full_dict[k] for k in games}
 
-    # Sampler/Pruner
+    # Optuna bits
     sampler = optuna.samplers.TPESampler(seed=0)
     pruner = optuna.pruners.MedianPruner(n_startup_trials=3)
+    shard_name = shard_study_name(base_study_name, games)
 
     tuner = Tuner(
         script=CLEANRL_PPO,
@@ -229,46 +241,39 @@ def worker_entry(
         target_scores=target_scores,
         pruner=pruner,
         sampler=sampler,
-        # If your Tuner supports a shared Optuna DB, uncomment:
-        # storage=storage_url,
-        # study_name=f"{study_name}_{shard}",
+        storage=storage_url,            # <<< persistent storage
+        study_name=shard_name,          # <<< load_if_exists=True inside Tuner
         params_fn=lambda trial: {
             **default_params_fn(trial),
-            # turn on W&B logging in CleanRL runs (Tyro flags):
             **({
                 "wandb-project-name": wandb_project,
                 **({"wandb-entity": wandb_entity} if wandb_entity else {})
             } if wandb_enable else {})
         },
-        # If your Tuner has stdout/stderr redirection hooks, you can pass them here; otherwise
-        # the child processes inherit this worker’s stdio (which we optionally redirect below).
     )
 
     try:
         if multi_mode:
-            # Redirect both streams to a file; ensure Windows-safe encoding
-            with open(log_path, "w", encoding="utf-8", errors="replace") as logf:
-                # Replace the worker’s stdio so all child prints (including subprocess children that inherit)
-                # go to this file.
+            with open(log_path, "a", encoding="utf-8", errors="replace") as logf:
                 old_out, old_err = sys.stdout, sys.stderr
                 sys.stdout = logf  # type: ignore
                 sys.stderr = logf  # type: ignore
                 try:
+                    os.environ.update(env)
                     tuner.tune(num_trials=num_trials, num_seeds=num_seeds)
                 finally:
                     sys.stdout.flush(); sys.stderr.flush()
                     sys.stdout, sys.stderr = old_out, old_err
         else:
-            # Single GPU/CPU: print to console directly
+            os.environ.update(env)
             tuner.tune(num_trials=num_trials, num_seeds=num_seeds)
     except Exception as e:
-        # On error: echo the last few log lines (if multi) or the exception, then signal failure
         msg = f"[{shard}] ERROR: {e}"
         if multi_mode:
             try:
                 tail = ""
                 if log_path.exists():
-                    tail = "".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines(True)[-50:])
+                    tail = "".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines(True)[-80:])
                 print(msg, file=sys.stderr, flush=True)
                 if tail:
                     print(f"[{shard}] --- log tail ---", file=sys.stderr, flush=True)
@@ -281,14 +286,13 @@ def worker_entry(
             returncode_sentinel.value = 1
         return
 
-    # Try to persist this shard’s best trial summary
+    # Persist this shard’s best trial summary (best_* files are additive; OK across resumes)
     best = None
     try:
         study = getattr(tuner, "study", None)
         if study and getattr(study, "best_trial", None) is not None:
             bt = study.best_trial
             best = {"value": bt.value, "params": bt.params, "number": bt.number}
-        # Fallbacks for other Tuner versions
         for attr in ("best_result", "best_params", "best_value"):
             if best is None and hasattr(tuner, attr):
                 br = getattr(tuner, attr)
@@ -312,7 +316,9 @@ def main():
     ap.add_argument("--num_seeds", type=int, default=3)
     ap.add_argument("--study_name", type=str, default="ppo_atari_tune")
     ap.add_argument("--storage_url", type=str, default=None,
-                    help='Optuna storage URL (e.g. "sqlite:///tuning.db")')
+                    help='Optuna storage URL (e.g. "sqlite:///tuning.db"). If not set, a sqlite DB is created in the run dir.')
+    ap.add_argument("--resume_dir", type=str, default=None,
+                    help="Resume a previous run directory (expects an optuna.db or valid --storage_url).")
     ap.add_argument("--cpu_per_gpu", type=int, default=None,
                     help="Override CPU cores per GPU (Linux only, best-effort)")
     ap.add_argument("--wandb_enable", type=lambda s: s.lower() in {"1","true","yes"}, default=True)
@@ -324,24 +330,41 @@ def main():
     games_dict = TARGET_SCORES_EVAL if args.use_eval_set else TARGET_SCORES_TUNE
     game_keys = list(games_dict.keys())
 
+    # Determine run_dir and storage
+    if args.resume_dir:
+        run_dir = Path(args.resume_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[tuner] Resuming in: {run_dir.resolve()}")
+        storage_url = args.storage_url or default_sqlite_url(str(run_dir))
+    else:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(args.results_dir) / f"run_{ts}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        storage_url = args.storage_url or default_sqlite_url(str(run_dir))
+        print(f"[tuner] Starting new run in: {run_dir.resolve()}")
+
+    # Save a little meta file to make resuming easy
+    meta_path = run_dir / "run_meta.json"
+    meta = {"storage_url": storage_url, "study_name_base": args.study_name,
+            "use_eval_set": args.use_eval_set, "games": game_keys}
+    try:
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
     ngpu = detect_gpus()
     multi = ngpu >= 2
     print(f"[tuner] GPUs detected: {ngpu} | multi-GPU mode: {multi}")
-
-    # Fresh run folder
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = str(Path(args.results_dir) / f"run_{ts}")
-    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    os.makedirs(run_dir / "logs" if hasattr(run_dir, "__truediv__") else Path(run_dir, "logs"), exist_ok=True)
 
     if not multi:
-        # Single GPU or CPU: run inline, logs go to console
-        # Still write best_overall.json at the end
+        # Single GPU/CPU
         rc = mp.Value("i", 0)
         os.environ["MULTI_GPU_MODE"] = "0"
         worker_entry(
             gpu_idx=None,
             games=game_keys,
-            run_dir=run_dir,
+            run_dir=str(run_dir),
             use_eval_set=args.use_eval_set,
             num_trials=args.num_trials,
             num_seeds=args.num_seeds,
@@ -353,8 +376,8 @@ def main():
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             cpu_ids=None,
-            storage_url=args.storage_url,
-            study_name=args.study_name,
+            storage_url=storage_url,
+            base_study_name=args.study_name,
             returncode_sentinel=rc,
         )
         # Collate best
@@ -375,7 +398,6 @@ def main():
         if best_overall:
             print(f"[tuner] Best score: {best_overall['value']:.4f} from {best_overall['source']}")
             print(f"[tuner] Best params: {best_overall['params']}")
-        # Exit with worker return code if any
         sys.exit(rc.value)
 
     # Multi-GPU mode
@@ -410,7 +432,7 @@ def main():
             args=(
                 idx,                           # gpu_idx
                 shard_games,                   # games
-                run_dir,
+                str(run_dir),
                 args.use_eval_set,
                 args.num_trials,
                 args.num_seeds,
@@ -422,7 +444,7 @@ def main():
                 args.wandb_project,
                 args.wandb_entity,
                 cpu_slices[idx] if idx < len(cpu_slices) else None,
-                args.storage_url,
+                storage_url,
                 args.study_name,
                 returncode_sentinel,
             ),
@@ -441,10 +463,8 @@ def main():
                 if p.is_alive():
                     all_done = False
                 else:
-                    # Process exited; check code
                     if p.exitcode and p.exitcode != 0:
                         any_fail = True
-            # also check explicit sentinel set by worker exceptions
             if returncode_sentinel.value != 0:
                 any_fail = True
             if any_fail:
@@ -452,7 +472,6 @@ def main():
                 for p in procs:
                     if p.is_alive():
                         try:
-                            # cross-platform best-effort termination
                             if os.name == "nt":
                                 p.terminate()
                             else:
@@ -468,7 +487,6 @@ def main():
             if all_done:
                 break
     finally:
-        # ensure no stragglers
         for p in procs:
             if p.is_alive():
                 try:
@@ -498,6 +516,5 @@ def main():
         print(f"[tuner] Best params: {best_overall['params']}")
 
 if __name__ == "__main__":
-    # Spawn method that works on Windows
-    mp.set_start_method("spawn", force=True)
+    mp.set_start_method("spawn", force=True)  # Windows-friendly
     main()

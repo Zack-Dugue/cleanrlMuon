@@ -165,27 +165,7 @@ if __name__ == "__main__":
     critic_params = list(agent.critic.parameters())
     actor_critic_ids = {id(p) for p in actor_params + critic_params}
 
-    # "feature" params = everything not in actor/critic
-    feature_params = [p for p in agent.parameters() if id(p) not in actor_critic_ids]
 
-    # (A) generic splits by dimensionality
-    def is_weight_like(p: torch.nn.Parameter) -> bool:
-        return p.ndim >= 2
-
-    def is_bias_like(p: torch.nn.Parameter) -> bool:
-        return p.ndim < 2
-
-    # (B) Optional: gate Muon for CPU (skip convs and tiny mats; fewer NS steps)
-    def use_muon_for_param(p: torch.nn.Parameter, device_type: str) -> bool:
-        if device_type == "cpu":
-            if p.ndim == 4:  # conv weights → keep on aux Adam on CPU
-                return False
-            if p.ndim == 2:
-                m = min(p.shape[-2], p.shape[-1])
-                return m >= 512  # threshold you can tune
-            return False
-        # GPU: allow for all weight-like tensors (ndim >= 2)
-        return is_weight_like(p)
 
     device_type = device.type
     if args.optimizer == "SGD":
@@ -193,8 +173,7 @@ if __name__ == "__main__":
     elif args.optimizer == "Adam":
         optimizer = optim.Adam(agent.parameters(), betas=(args.momentum, 0.999), lr=args.learning_rate, eps=1e-5)
     elif args.optimizer == "Muon":
-        muon_params = [p for p in feature_params if use_muon_for_param(p, device_type)]
-        aux_params = [p for p in agent.parameters() if p not in muon_params]  # includes biases + heads
+        muon_params, aux_params = agent.get_split_params()
         ns_steps = 2 if device_type == "cpu" else 5
         param_groups = [
             dict(params=muon_params, lr=args.learning_rate, momentum=args.momentum,
@@ -204,8 +183,7 @@ if __name__ == "__main__":
         ]
         optimizer = MuonWithAuxAdam(param_groups)
     elif args.optimizer == "AdaMuon":
-        muon_params = [p for p in feature_params if use_muon_for_param(p, device_type)]
-        aux_params = [p for p in agent.parameters() if p not in muon_params]
+        muon_params, aux_params = agent.get_split_params()
         param_groups = [
             dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
             dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
