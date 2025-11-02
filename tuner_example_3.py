@@ -31,7 +31,7 @@ import optuna
 from cleanrl_utils.tuner import Tuner
 
 # -------- Path to your CleanRL PPO script (Tyro-based) --------
-CLEANRL_PPO = r"C:\Users\dugue\PycharmProjects\cleanrlMuon\cleanrl\ppo_atari.py"
+CLEANRL_PPO = r"cleanrl/ppo_atari.py"
 
 # -------- Tuning sets (unchanged) --------
 TARGET_SCORES_TUNE: Dict[str, Tuple[float, float]] = {
