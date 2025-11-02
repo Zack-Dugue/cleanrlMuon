@@ -162,6 +162,12 @@ class Agent(nn.Module):
         print(f"[Agent] Params in flatten_linear ({self.flattened_dim} -> 512): {flat_params:,}")
         print(f"[Agent] Total parameters (incl. heads): {total_params:,}")
 
+    def get_split_params(self):
+        muon_params = [p for p in self.backbone.parameters() if p.ndim >= 2] + \
+                      [p for p in self.mlp.parameters() if p.ndim >= 2]
+        adam_params = [p for p in self.parameters() if p not in muon_params]
+
+        return muon_params , adam_params
     # ---- API
     def get_value(self, x):
         x = x / 255.0
