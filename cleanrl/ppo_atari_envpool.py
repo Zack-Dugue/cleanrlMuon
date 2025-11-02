@@ -79,6 +79,9 @@ class Args:
     wandb_entity: str = None
     capture_video: bool = False  # EnvPool path doesn’t record videos by default
 
+    #multi_gpu stuff:
+    device: str = None
+
     # Algorithm
     env_id: str = "Breakout-v5"  # EnvPool ALE v5 id
     total_timesteps: int = 10_000_000
@@ -107,9 +110,17 @@ class Args:
     minibatch_size: int = 0
     num_iterations: int = 0
 
+#Need to fix the whole 'unpicklable nested function' thing BUT
+# We should ditch the gpu environment thing, and
+# Just directly set the GPU and the number of threads in multigpu_tuner_spv.
+
 # ----------------------------- main -----------------------------
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
