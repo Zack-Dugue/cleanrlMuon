@@ -165,7 +165,8 @@ class Agent(nn.Module):
     def get_split_params(self):
         muon_params = [p for p in self.backbone.parameters() if p.ndim >= 2] + \
                       [p for p in self.mlp.parameters() if p.ndim >= 2]
-        adam_params = [p for p in self.parameters() if p not in muon_params]
+        muon_ids = {id(p) for p in muon_params}
+        adam_params = [p for p in self.parameters() if id(p) not in muon_ids]
 
         return muon_params , adam_params
     # ---- API
