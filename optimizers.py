@@ -169,9 +169,9 @@ class AdaMuonWithAuxAdam(torch.optim.Optimizer):
                 g_mom = g.add(buf, alpha=momentum) if nesterov else buf
 
                 g_flat = g_mom
-                if g_flat.ndim == 4:
-                    g_flat = g_flat.view(len(g_flat), -1)
-                g_flat = g_flat.flatten()
+                if g_flat.ndim >= 2:
+                    g_flat.flatten(0,-1)
+
 
                 z = zeropower_via_newtonschulz5(torch.sign(g_flat), steps=ns_steps)
 
