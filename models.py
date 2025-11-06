@@ -19,6 +19,42 @@ class LayerNorm2d(nn.Module):
         x = x.permute(0,2,3,1); x = self.ln(x); x = x.permute(0,3,1,2)
         return x
 
+
+class AttentionBottleNeck(nn.Module):
+    def __init__(self, input_dim, embed_dim, num_queries, n_heads, final_hidden_dim, include_pool = False):
+        super().__init__()
+        self.input_norm = LayerNorm2d(embed_dim)
+        self.attn_proj = nn.Conv2d(input_dim,num_queries * n_heads, 1, groups=n_heads, bias=False)
+        self.val_proj = nn.Conv2d(input_dim,embed_dim,1)
+        self.n_heads = n_heads
+        self.num_queries = num_queries
+        self.final_linear = nn.Linear(embed_dim * num_queries, final_hidden_dim)
+
+    def forward(self,x):
+        # x dim -> B x C x H x W
+        B , C , H , W = x.size()
+        x = self.input_norm(x)
+        A_w = self.attn_proj(x)
+        A_w = torch.softmax(torch.flatten(A_w,2,3),2)
+        # A_w dim -> B x nquery*nhead x (H*W)
+        A_w = torch.reshape(A_w, [B* self.n_heads, self.num_queries, H*W])
+        # A_w dim -> B*nhead x nquery x (H*W)
+
+        V = self.val_proj(x)
+        V = torch.flatten(V,2,3)
+        V = torch.reshape(V,[B * self.n_heads, C//self.n_heads, H*W])
+        # V dim -> B*nhead x C/nheads  x H*W
+        V = torch.permute(V, [0, 2, 1])
+        # V dim -> B*nhead x H*W x C/nheads
+        A = torch.bmm(A_w, V)
+        # A dim -> B*nhead x nquery x C/nheads
+        A = torch.reshape(A,[B, self.num_queries*C])
+        o = self.final_linear(A)
+
+
+
+        return o
+
 class ConvNeXtBlock(nn.Module):
     def __init__(self, dim, mlp_ratio=4, kernel=5):
         super().__init__()
@@ -50,7 +86,7 @@ class PosEnc2DFourier(nn.Module):
     Fixed 2D Fourier features on HxW grid.
     Channels: [x, y, sin/cos bands on x and y], total Cpos = 2 + 4*bands (if include_xy).
     """
-    def __init__(self, H, W, bands=8, include_xy=True):
+    def __init__(self, H, W, bands=8, simple_linear = True, include_xy=True):
         super().__init__()
         ys = torch.linspace(0, 1, steps=H).view(H,1).expand(H,W)
         xs = torch.linspace(0, 1, steps=W).view(1,W).expand(H,W)
@@ -64,11 +100,16 @@ class PosEnc2DFourier(nn.Module):
             feats += [torch.sin(f*xs), torch.cos(f*xs)]
             feats += [torch.sin(f*ys), torch.cos(f*ys)]
         pe = torch.cat(feats, dim=1)  # (1,Cpos,H,W)
+        if simple_linear:
+            self.linear = nn.Linear(bands + include_xy, bands + include_xy, bias=False)
+            self.linear.weight.data = torch.eye(bands+include_xy)
+        else:
+            simple_linear = nn.Identity()
         self.register_buffer("pe", pe, persistent=False)
     @property
     def cpos(self): return self.pe.shape[1]
     def forward(self, B, device=None, dtype=None):
-        pe = self.pe
+        pe = self.linear(self.pe)
         if device is not None and pe.device != device:
             pe = pe.to(device=device, dtype=(dtype or pe.dtype))
         return pe.expand(B, -1, -1, -1)
@@ -165,8 +206,7 @@ class Agent(nn.Module):
     def get_split_params(self):
         muon_params = [p for p in self.backbone.parameters() if p.ndim >= 2] + \
                       [p for p in self.mlp.parameters() if p.ndim >= 2]
-        muon_ids = {id(p) for p in muon_params}
-        adam_params = [p for p in self.parameters() if id(p) not in muon_ids]
+        adam_params = [p for p in self.parameters() if p not in muon_params]
 
         return muon_params , adam_params
     # ---- API
