@@ -49,7 +49,6 @@ class AttentionBottleNeck(nn.Module):
         A = torch.bmm(A_w, V)
         # A dim -> B*nhead x nquery x C/nheads
         A = torch.reshape(A,[B, self.num_queries*C])
-        o = self.final_linear(A)
 
 
 
@@ -100,30 +99,56 @@ class PosEnc2DFourier(nn.Module):
             feats += [torch.sin(f*xs), torch.cos(f*xs)]
             feats += [torch.sin(f*ys), torch.cos(f*ys)]
         pe = torch.cat(feats, dim=1)  # (1,Cpos,H,W)
-        if simple_linear:
-            self.linear = nn.Linear(bands + include_xy, bands + include_xy, bias=False)
-            self.linear.weight.data = torch.eye(bands+include_xy)
-        else:
-            simple_linear = nn.Identity()
         self.register_buffer("pe", pe, persistent=False)
     @property
     def cpos(self): return self.pe.shape[1]
     def forward(self, B, device=None, dtype=None):
-        pe = self.linear(self.pe)
+        pe = self.pe
         if device is not None and pe.device != device:
             pe = pe.to(device=device, dtype=(dtype or pe.dtype))
         return pe.expand(B, -1, -1, -1)
+
+
+class PosEnc2DLearned(nn.Module):
+    """
+    Fixed 2D Fourier features on HxW grid.
+    Channels: [x, y, sin/cos bands on x and y], total Cpos = 2 + 4*bands (if include_xy).
+    """
+    def __init__(self, H, W, bands=8, simple_linear = True, include_xy=True):
+        super().__init__()
+        ys = torch.linspace(0, 1, steps=H).view(H,1).expand(H,W)
+        xs = torch.linspace(0, 1, steps=W).view(1,W).expand(H,W)
+        xs = xs.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        ys = ys.unsqueeze(0).unsqueeze(0)
+        feats = []
+        if include_xy:
+            feats += [xs, ys]
+        for k in range(bands):
+            f = (2.0**k) * math.pi
+            feats += [torch.sin(f*xs), torch.cos(f*xs)]
+            feats += [torch.sin(f*ys), torch.cos(f*ys)]
+        pe = torch.cat(feats, dim=1)  # (1,Cpos,H,W)
+        self.pe = nn.Parameter(pe,requires_grad=True)
+
+    @property
+    def cpos(self): return self.pe.shape[1]
+    def forward(self, B, device=None, dtype=None):
+        pe = self.pe
+        if device is not None and pe.device != device:
+            pe = pe.to(device=device, dtype=(dtype or pe.dtype))
+        return pe.expand(B, -1, -1, -1)
+
 
 class EmbedWithPE(nn.Module):
     """
     Embed conv + LN, then add Fourier features projected to same channels.
     y = LN(Conv(x)); y = y + Conv1x1(PE)
     """
-    def __init__(self, in_ch, out_ch, out_H, out_W, bands=8):
+    def __init__(self, in_ch, out_ch, out_H, out_W, bands=8, learned_pe = True):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=True)
         self.ln   = LayerNorm2d(out_ch)
-        self.pe   = PosEnc2DFourier(out_H, out_W, bands=bands, include_xy=True)
+        self.pe   = PosEnc2DLearned(out_H, out_W, bands=bands, include_xy=True)
         self.pe_proj = nn.Conv2d(self.pe.cpos, out_ch, kernel_size=1, bias=True)
         # report
         self.pe_params = self.pe_proj.weight.numel() + (self.pe_proj.bias.numel() if self.pe_proj.bias is not None else 0)
