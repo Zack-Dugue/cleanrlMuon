@@ -1,7 +1,7 @@
 import torch
 import torch.distributed as dist
 from torch import Tensor
-
+import math
 # ----- your existing zeropower_via_newtonschulz5 -----
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     assert G.ndim >= 2
@@ -444,3 +444,230 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
 
         if handle is not None:
             apply_prev()
+
+
+
+
+
+
+class BGD(torch.optim.Optimizer):
+    """Implements BGD.
+    A simple usage of BGD would be:
+    for samples, labels in batches:
+        for mc_iter in range(mc_iters):
+            optimizer.randomize_weights()
+            output = model.forward(samples)
+            loss = cirterion(output, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.aggregate_grads()
+        optimizer.step()
+    """
+    def __init__(self, params, std_init, mean_eta=1, std_eta = 1, std_exp_factor = 1 , mc_iters=20, betas=(0.9,0.999, .9), warm_up_iters = 200,paranoia=2):
+        """
+        Initialization of BGD optimizer
+        group["mean_param"] is the learned mean.
+        group["std_param"] is the learned STD.
+        :param params: List of model parameters
+        :param std_init: Initialization value for STD parameter
+        :param mean_eta: Eta value
+        :param mc_iters: Number of Monte Carlo iteration. Used for correctness check.
+                         Use None to disable the check.
+        """
+        super(BGD, self).__init__(params, defaults={})
+        assert mc_iters is None or (type(mc_iters) == int and mc_iters > 0), "mc_iters should be positive int or None."
+        self.std_init = std_init
+        self.mean_eta = mean_eta / std_init
+        self.std_eta = std_eta / std_init
+        self.std_exp_factor = std_exp_factor
+        self.mc_iters = mc_iters
+        self.betas = betas
+        self.fast_eps = 1e-10
+        self.n_steps = 1
+        self.warm_up_iters = warm_up_iters
+        # Initialize mu (mean_param) and sigma (std_param)
+        self.paranoia = paranoia
+        for group in self.param_groups:
+
+            assert len(group["params"]) == 1, "BGD optimizer does not support multiple params in a group"
+            # group['params'][0] is the weights
+            assert isinstance(group["params"][0], torch.Tensor), "BGD expect param to be a tensor"
+            # We use the initialization of weights to initialize the mean.
+            group["mean_param"] = group["params"][0].data.clone()
+            group["std_param"] = torch.zeros_like(group["params"][0].data).add_(self.std_init)
+            group["mom"] = torch.zeros_like(group["params"][0].data)
+            group["mom_var"] = torch.zeros_like(group["params"][0].data)
+            group["std_mom"] = torch.zeros_like(group["params"][0].data)
+            group["lr"] = self.mean_eta
+            group["std_lr"] = self.std_eta
+            group["std_reg"] = self.std_exp_factor
+
+        self._init_accumulators()
+
+    def get_mc_iters(self):
+        return self.mc_iters
+
+    def _init_accumulators(self):
+        self.mc_iters_taken = 0
+        for group in self.param_groups:
+            group["eps"] = None
+            group["grad_mul_eps_sum"] = torch.zeros_like(group["params"][0].data)
+            group["grad_sum"] = torch.zeros_like(group["params"][0].data)
+
+    @staticmethod
+    def create_unique_param_groups(model):
+        """
+        Create a unique parameter group for each parameter in the given model.
+        """
+        param_groups = []
+        for param in model.parameters():
+            param_groups.append({'params': [param]})
+        return param_groups
+
+    def randomize_weights(self, force_std=-1):
+        """
+        Randomize the weights according to N(mean, std).
+        :param force_std: If force_std>=0 then force_std is used for STD instead of the learned STD.
+        :return: None
+        """
+        std_mean = 0
+        for group in self.param_groups:
+            mean = group["mean_param"]
+            std = group["std_param"]
+            std_mean += std.mean()
+            if force_std >= 0:
+                std = std.mul(0).add(force_std)
+            group["eps"] = torch.normal(torch.zeros_like(mean), self.paranoia)
+            # Reparameterization trick (here we set the weights to their randomized value):
+            group["params"][0].data.copy_(mean.add(std.mul(group["eps"])))
+        #print(std_mean/len(self.param_groups))
+
+    def aggregate_grads(self, batch_size):
+        """
+        Aggregates a single Monte Carlo iteration gradients. Used in step() for the expectations calculations.
+        optimizer.zero_grad() should be used before calling .backward() once again.
+        :param batch_size: BGD is using non-normalized gradients, but PyTorch gives normalized gradients.
+                            Therefore, we multiply the gradients by the batch size.
+        :return: None
+        """
+        self.mc_iters_taken += 1
+        groups_cnt = 0
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        for group in self.param_groups:
+            for each in group.keys():
+                if isinstance(group[each], torch.Tensor):
+                    group[each] = group[each].to(device)
+            if group["params"][0].grad is None:
+                continue
+            assert group["eps"] is not None, "Must randomize weights before using aggregate_grads"
+            groups_cnt += 1
+            grad = group["params"][0].grad.data.mul(batch_size)
+            # group["grad_sum"] = group["grad_sum"].detach().cpu()
+            # grad = grad.detach().cpu()
+            group["grad_sum"].add_(grad)
+            group["grad_mul_eps_sum"].add_(grad.mul(group["eps"]))
+            group["eps"] = None
+
+        assert groups_cnt > 0, "Called aggregate_grads, but all gradients were None. Make sure you called .backward()"
+
+    def get_stats(self):
+        avg_mean_sq = 0
+        avg_var = 0
+        param_count = 0
+        avg_grad_sq = 0
+        avg_grad_epsilon = 0
+        with torch.no_grad():
+            for group in self.param_groups:
+                mean = group["mean_param"]
+                std = group["std_param"]
+                e_grad = group["grad_sum"].div(self.mc_iters_taken)
+                e_grad_epsilon = group["grad_mul_eps_sum"].div(self.mc_iters_taken)
+
+                avg_mean_sq += torch.sum(mean**2)
+                avg_var += torch.sum(std**2)
+                param_count += torch.numel(mean)
+                avg_grad_sq += torch.sum(e_grad**2)
+                avg_grad_epsilon += torch.sum(e_grad_epsilon)
+
+        return float(avg_mean_sq / param_count) , float(avg_var / param_count), float(avg_grad_sq / param_count), float(avg_grad_epsilon / param_count)
+
+    def get_std_distribution(self, bucket_range = None, num_buckets = 1000):
+        if bucket_range == None:
+            bucket_range = self.std_init * 2
+        with torch.no_grad():
+            running_hist = torch.zeros(num_buckets)
+            param_count = 0
+            for group in self.param_groups:
+                std = group["std_param"]
+
+                if std.data.device != running_hist.device:
+                    running_hist = running_hist.to(std.data.device)
+
+
+                new_hist = torch.histc(std,num_buckets, min = 0, max =bucket_range)
+                if std.data.device != new_hist.device:
+                    running_hist.to(std.data.device)
+
+                running_hist = running_hist + new_hist
+                param_count += torch.numel(std)
+
+            return running_hist / param_count
+
+    def step(self, closure=None):
+        """
+        Updates the learned mean and STD.
+        :return:
+        """
+        # Makes sure that self.mc_iters had been taken.
+        assert self.mc_iters is None or self.mc_iters == self.mc_iters_taken, "MC iters is set to " \
+                                                                              + str(self.mc_iters) \
+                                                                              + ", but took " + \
+                                                                              str(self.mc_iters_taken) + " MC iters"
+        max_grads = []
+        for group in self.param_groups:
+            mean = group["mean_param"]
+            std = group["std_param"]
+            mom = group["mom"]
+            mom_var = group["mom_var"]
+            mean_eta = group["lr"]
+            std_eta = group["std_lr"]
+            std_exp_factor = group["std_reg"]
+            std_mom = group["std_mom"]
+
+
+            if self.n_steps < self.warm_up_iters:
+                mean_eta = mean_eta * math.sin( self.n_steps * (math.pi / self.warm_up_iters))**2
+            if self.n_steps < 2 * self.warm_up_iters:
+                std_eta = std_eta * math.sin( self.n_steps * (math.pi / (self.warm_up_iters*2)))**2
+
+
+            # Divide gradients by MC iters to get expectation
+            e_grad = group["grad_sum"].div(self.mc_iters_taken)
+            e_grad_eps = group["grad_mul_eps_sum"].div(self.mc_iters_taken)
+            max_grads.append(e_grad.max().item())
+
+
+
+            alpha = (math.sqrt(1-self.betas[1]**(self.n_steps))/(1-self.betas[0]**(self.n_steps)))*(mean_eta*std.pow(2))
+
+            mom.copy_(self.betas[0]*mom + (1-self.betas[0])*(e_grad))
+            mom_var.copy_(self.betas[1]*mom_var + (1-self.betas[1])*(e_grad).pow(2))
+            mean.add_(-mom*mean_eta*std.pow(2))
+            if torch.sum(torch.isnan(mean)):
+                raise ValueError("Badam optimizer has caused nan mean value.")
+    
+            # tmp_mean = mean + (-alpha*std.pow(2)*(
+            #     mom / (torch.sqrt(mom_var)+self.fast_eps)
+            # )
+            # )
+
+            std_mom.copy_(self.betas[2]*std_mom + (1-self.betas[2])*(std_eta*e_grad_eps))
+            std_val = std_mom
+
+            sqrt_term = torch.sqrt(std_val.mul(std).div(2).pow(2).add(std_exp_factor)).mul(std)
+            final_std_val = sqrt_term.add(-std_val.mul(std.pow(2)).div(2))
+            std.copy_(torch.clamp(final_std_val,min=.0001*self.std_init, max = 2*self.std_init))
+
+        self.n_steps+=1
+        self.randomize_weights(force_std=0)
+        self._init_accumulators()

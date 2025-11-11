@@ -17,7 +17,7 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 # your modules
-from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam
+from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD
 from models import Agent  # <- uses your Agent class
 
 # ------------------ small wrapper to mimic CleanRL stats ------------------
@@ -172,6 +172,7 @@ if __name__ == "__main__":
 
     # model
     agent = Agent(envs).to(device)
+    MC_Method = False
 
     # -------- Optimizer selection (mirrors your PPO Atari code) --------
     device_type = device.type
@@ -196,6 +197,11 @@ if __name__ == "__main__":
             dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = AdaMuonWithAuxAdam(param_groups)
+    elif args.optimizer == "BGD":
+        params = BGD.create_unique_param_groups(agent)
+        optimizer = BGD(params, std_init =.04, mean_eta=args.learning_rate,
+                              betas = (args.momentum, .999, .99), mc_iters = 1)
+        MC_Method = True
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
@@ -224,7 +230,8 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             for g in optimizer.param_groups:
                 g["lr"] = lrnow
-
+        if MC_Method:
+            optimizer.randomize_weights()
         for step in range(args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -290,6 +297,8 @@ if __name__ == "__main__":
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
+                if MC_Method:
+                    optimizer.randomize_weights()
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
@@ -327,6 +336,8 @@ if __name__ == "__main__":
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
+                if MC_Method:
+                    optimizer.aggregate_grads(1)
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)

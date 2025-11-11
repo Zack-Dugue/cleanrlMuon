@@ -12,7 +12,7 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam
+from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD
 from models import Agent
 
 from cleanrl_utils.atari_wrappers import (  # isort:skip
@@ -44,7 +44,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "BreakoutNoFrameskip-v4"
+    env_id: str = "SeaquestNoFrameskip-v4"
     """the id of the environment"""
     total_timesteps: int = 10_000_000
     """total timesteps of the experiments"""
@@ -79,7 +79,7 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
     # Optimizer stuff
-    optimizer: str = "Adam"  # ["SGD", "Adam", "Muon", "AdaMuon"]
+    optimizer: str = "Muon"  # ["SGD", "Adam", "Muon", "AdaMuon"]
     momentum: float = 0.9
 
     # to be filled in runtime
@@ -166,7 +166,7 @@ if __name__ == "__main__":
     actor_critic_ids = {id(p) for p in actor_params + critic_params}
 
 
-
+    MC_Method = False
     device_type = device.type
     if args.optimizer == "SGD":
         optimizer = optim.SGD(agent.parameters(), momentum=args.momentum, lr=args.learning_rate)
@@ -189,6 +189,11 @@ if __name__ == "__main__":
             dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = AdaMuonWithAuxAdam(param_groups)
+    elif args.optimizer == "BGD":
+        params = BGD.create_unique_param_groups(agent)
+        optimizer = BGD(params, std_init =.04, mean_eta=args.learning_rate,
+                              betas = (args.momentum, .999, .99), mc_iters = 1)
+        MC_Method = True
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
@@ -214,7 +219,8 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             for g in optimizer.param_groups:
                 g["lr"] = lrnow
-
+        if MC_Method:
+            optimizer.randomize_weights()
         for step in range(args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -270,6 +276,8 @@ if __name__ == "__main__":
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
+                if MC_Method:
+                    optimizer.randomize_weights()
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
@@ -312,6 +320,8 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                if MC_Method:
+                    optimizer.aggregate_grads(1)
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
