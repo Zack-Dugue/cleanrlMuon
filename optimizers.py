@@ -655,7 +655,7 @@ class BGD(torch.optim.Optimizer):
             mean.add_(-mom*mean_eta*std.pow(2))
             if torch.sum(torch.isnan(mean)):
                 raise ValueError("Badam optimizer has caused nan mean value.")
-    
+
             # tmp_mean = mean + (-alpha*std.pow(2)*(
             #     mom / (torch.sqrt(mom_var)+self.fast_eps)
             # )

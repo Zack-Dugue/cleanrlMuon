@@ -85,7 +85,7 @@ class PosEnc2DFourier(nn.Module):
     Fixed 2D Fourier features on HxW grid.
     Channels: [x, y, sin/cos bands on x and y], total Cpos = 2 + 4*bands (if include_xy).
     """
-    def __init__(self, H, W, bands=8, simple_linear = True, include_xy=True):
+    def __init__(self, H, W, bands=8, include_xy=True):
         super().__init__()
         ys = torch.linspace(0, 1, steps=H).view(H,1).expand(H,W)
         xs = torch.linspace(0, 1, steps=W).view(1,W).expand(H,W)
@@ -114,15 +114,14 @@ class PosEnc2DLearned(nn.Module):
     Fixed 2D Fourier features on HxW grid.
     Channels: [x, y, sin/cos bands on x and y], total Cpos = 2 + 4*bands (if include_xy).
     """
-    def __init__(self, H, W, bands=8, simple_linear = True, include_xy=True):
+    def __init__(self, H, W, bands=8):
         super().__init__()
         ys = torch.linspace(0, 1, steps=H).view(H,1).expand(H,W)
         xs = torch.linspace(0, 1, steps=W).view(1,W).expand(H,W)
         xs = xs.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
         ys = ys.unsqueeze(0).unsqueeze(0)
         feats = []
-        if include_xy:
-            feats += [xs, ys]
+
         for k in range(bands):
             f = (2.0**k) * math.pi
             feats += [torch.sin(f*xs), torch.cos(f*xs)]
@@ -148,15 +147,15 @@ class EmbedWithPE(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=True)
         self.ln   = LayerNorm2d(out_ch)
-        self.pe   = PosEnc2DLearned(out_H, out_W, bands=bands, include_xy=True)
-        self.pe_proj = nn.Conv2d(self.pe.cpos, out_ch, kernel_size=1, bias=True)
+        self.pe   = PosEnc2DLearned(out_H, out_W, bands=out_ch//4)
+        # self.pe_proj = nn.Conv2d(self.pe.cpos, out_ch, kernel_size=1, bias=True)
         # report
-        self.pe_params = self.pe_proj.weight.numel() + (self.pe_proj.bias.numel() if self.pe_proj.bias is not None else 0)
+        # self.pe_params = self.pe_proj.weight.numel() + (self.pe_proj.bias.numel() if self.pe_proj.bias is not None else 0)
     def forward(self, x):
         y = self.ln(self.conv(x))
         B, _, H, W = y.shape
         pe = self.pe(B, device=y.device, dtype=y.dtype)
-        y = y + self.pe_proj(pe)
+        y = y + self.pe.pe
         return y
 
 # -------- Agent --------
@@ -222,7 +221,7 @@ class Agent(nn.Module):
         # ---- reporting
         total_params = sum(p.numel() for p in self.parameters())
         flat_params  = self.flattened_dim * 512 + 512
-        print(f"[Agent] Embed out: C={dims[0]}, H={out_h}, W={out_w} | PE proj params: {self.embed.pe_params:,}")
+        print(f"[Agent] Embed out: C={dims[0]}, H={out_h}, W={out_w} | PE proj params: {0}")
         print(f"[Agent] Backbone out: C={bottleneck_red}, H={Hb}, W={Wb}")
         print(f"[Agent] Flattened dim: {self.flattened_dim:,}")
         print(f"[Agent] Params in flatten_linear ({self.flattened_dim} -> 512): {flat_params:,}")
@@ -231,7 +230,8 @@ class Agent(nn.Module):
     def get_split_params(self):
         muon_params = [p for p in self.backbone.parameters() if p.ndim >= 2] + \
                       [p for p in self.mlp.parameters() if p.ndim >= 2]
-        adam_params = [p for p in self.parameters() if p not in muon_params]
+        muon_ids = {id(p) for p in self.parameters()}
+        adam_params = [p for p in self.parameters() if id(p) not in muon_ids]
 
         return muon_params , adam_params
     # ---- API

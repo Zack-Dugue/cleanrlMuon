@@ -379,7 +379,7 @@ class MultiGPUTuner:
             sys.exit(1)
         finally:
             if len(study.trials) > 0:
-                MAIN_LOGGER.info(f"Trials completed: {len(study.trials)}; Best={getattr(study.best_trial, 'value', None)}")
+                MAIN_LOGGER.info(f"Trials completed: {len(study.trials)}; Best={getattr (study.best_trial, 'value', None)}")
             else:
                 MAIN_LOGGER.info("No trials completed.")
         MAIN_LOGGER.info(f"BEST TRIAL: value={study.best_trial.value} params={study.best_trial.params}")
