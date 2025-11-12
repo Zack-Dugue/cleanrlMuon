@@ -86,7 +86,7 @@ class PosEnc2DFourier(nn.Module):
     Fixed 2D Fourier features on HxW grid.
     Channels: [x, y, sin/cos bands on x and y], total Cpos = 2 + 4*bands (if include_xy).
     """
-    def __init__(self, H, W, bands=8, simple_linear = True, include_xy=True):
+    def __init__(self, H, W, bands=8, include_xy=True):
         super().__init__()
         ys = torch.linspace(0, 1, steps=H).view(H,1).expand(H,W)
         xs = torch.linspace(0, 1, steps=W).view(1,W).expand(H,W)
@@ -104,18 +104,17 @@ class PosEnc2DFourier(nn.Module):
     @property
     def cpos(self): return self.pe.shape[1]
     def forward(self, B, device=None, dtype=None):
-        pe = self.linear(self.pe)
+        pe = self.pe
         if device is not None and pe.device != device:
             pe = pe.to(device=device, dtype=(dtype or pe.dtype))
         return pe.expand(B, -1, -1, -1)
-
 
 class EmbedWithPE(nn.Module):
     """
     Embed conv + LN, then add Fourier features projected to same channels.
     y = LN(Conv(x)); y = y + Conv1x1(PE)
     """
-    def __init__(self, in_ch, out_ch, out_H, out_W, bands=8, learned_pe = True):
+    def __init__(self, in_ch, out_ch, out_H, out_W, bands=8):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=True)
         self.ln   = LayerNorm2d(out_ch)
