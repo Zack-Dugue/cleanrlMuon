@@ -191,7 +191,7 @@ if __name__ == "__main__":
         optimizer = AdaMuonWithAuxAdam(param_groups)
     elif args.optimizer == "BGD":
         params = BGD.create_unique_param_groups(agent)
-        optimizer = BGD(params, std_init =.04, mean_eta=args.learning_rate,
+        optimizer = BGD(params, std_init =.01, mean_eta=args.learning_rate, std_eta= 10,
                               betas = (args.momentum, .999, .99), mc_iters = 1)
         MC_Method = True
     else:

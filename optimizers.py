@@ -463,7 +463,7 @@ class BGD(torch.optim.Optimizer):
             optimizer.aggregate_grads()
         optimizer.step()
     """
-    def __init__(self, params, std_init, mean_eta=1, std_eta = 1, std_exp_factor = 1 , mc_iters=20, betas=(0.9,0.999, .9), warm_up_iters = 200,paranoia=2):
+    def __init__(self, params, std_init, mean_eta=1, std_eta = 1, std_exp_factor = 1 , mc_iters=20, betas=(0.9,0.999, .9), warm_up_iters = 200,paranoia=1):
         """
         Initialization of BGD optimizer
         group["mean_param"] is the learned mean.
@@ -477,8 +477,8 @@ class BGD(torch.optim.Optimizer):
         super(BGD, self).__init__(params, defaults={})
         assert mc_iters is None or (type(mc_iters) == int and mc_iters > 0), "mc_iters should be positive int or None."
         self.std_init = std_init
-        self.mean_eta = mean_eta / std_init
-        self.std_eta = std_eta / std_init
+        self.mean_eta = mean_eta / std_init**2
+        self.std_eta = std_eta / std_init**2
         self.std_exp_factor = std_exp_factor
         self.mc_iters = mc_iters
         self.betas = betas
@@ -496,7 +496,6 @@ class BGD(torch.optim.Optimizer):
             group["mean_param"] = group["params"][0].data.clone()
             group["std_param"] = torch.zeros_like(group["params"][0].data).add_(self.std_init)
             group["mom"] = torch.zeros_like(group["params"][0].data)
-            group["mom_var"] = torch.zeros_like(group["params"][0].data)
             group["std_mom"] = torch.zeros_like(group["params"][0].data)
             group["lr"] = self.mean_eta
             group["std_lr"] = self.std_eta
@@ -651,7 +650,6 @@ class BGD(torch.optim.Optimizer):
             alpha = (math.sqrt(1-self.betas[1]**(self.n_steps))/(1-self.betas[0]**(self.n_steps)))*(mean_eta*std.pow(2))
 
             mom.copy_(self.betas[0]*mom + (1-self.betas[0])*(e_grad))
-            mom_var.copy_(self.betas[1]*mom_var + (1-self.betas[1])*(e_grad).pow(2))
             mean.add_(-mom*mean_eta*std.pow(2))
             if torch.sum(torch.isnan(mean)):
                 raise ValueError("Badam optimizer has caused nan mean value.")

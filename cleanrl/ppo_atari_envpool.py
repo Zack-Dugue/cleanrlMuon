@@ -199,8 +199,8 @@ if __name__ == "__main__":
         optimizer = AdaMuonWithAuxAdam(param_groups)
     elif args.optimizer == "BGD":
         params = BGD.create_unique_param_groups(agent)
-        optimizer = BGD(params, std_init =.04, mean_eta=args.learning_rate,
-                              betas = (args.momentum, .999, .99), mc_iters = 1)
+        optimizer = BGD(params, std_init=.01, mean_eta=args.learning_rate, std_eta=10,
+                        betas=(args.momentum, .999, .99), mc_iters=1)
         MC_Method = True
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
@@ -231,7 +231,7 @@ if __name__ == "__main__":
             for g in optimizer.param_groups:
                 g["lr"] = lrnow
         if MC_Method:
-            optimizer.randomize_weights()
+            optimizer.randomize_weights(force_std=0)
         for step in range(args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
