@@ -627,7 +627,6 @@ class BGD(torch.optim.Optimizer):
             mean = group["mean_param"]
             std = group["std_param"]
             mom = group["mom"]
-            mom_var = group["mom_var"]
             mean_eta = group["lr"]
             std_eta = group["std_lr"]
             std_exp_factor = group["std_reg"]
