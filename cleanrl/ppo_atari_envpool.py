@@ -17,7 +17,7 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 # your modules
-from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD
+from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD, SingleDeviceNorMuonWithAuxAdam
 from models import Agent  # <- uses your Agent class
 
 # ------------------ small wrapper to mimic CleanRL stats ------------------
@@ -190,18 +190,20 @@ if __name__ == "__main__":
                  weight_decay=1e-4, use_muon=False),
         ]
         optimizer = MuonWithAuxAdam(param_groups)
-    elif args.optimizer == "AdaMuon":
+    elif args.optimizer == "NorMuon":
         muon_params, aux_params = agent.get_split_params()
         param_groups = [
             dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
             dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
         ]
-        optimizer = AdaMuonWithAuxAdam(param_groups)
+        optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
     elif args.optimizer == "BGD":
         params = BGD.create_unique_param_groups(agent)
         optimizer = BGD(params, std_init=.01, mean_eta=args.learning_rate, std_eta=10,
                         betas=(args.momentum, .999, .99), mc_iters=1)
         MC_Method = True
+
+
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 

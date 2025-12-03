@@ -12,7 +12,7 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD
+from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD, SingleDeviceNorMuonWithAuxAdam
 from models import Agent
 
 from cleanrl_utils.atari_wrappers import (  # isort:skip
@@ -189,6 +189,13 @@ if __name__ == "__main__":
             dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = AdaMuonWithAuxAdam(param_groups)
+    elif args.optimizer == "NorMuon":
+        muon_params, aux_params = agent.get_split_params()
+        param_groups = [
+            dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
+            dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
+        ]
+        optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
     elif args.optimizer == "BGD":
         params = BGD.create_unique_param_groups(agent)
         optimizer = BGD(params, std_init =.01, mean_eta=args.learning_rate, std_eta= 10,
