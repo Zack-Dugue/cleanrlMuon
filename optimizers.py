@@ -1,9 +1,9 @@
+from __future__ import annotations
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
 import math
-
-from __future__ import annotations
 
 from typing import Iterable, List, Dict, Any
 
