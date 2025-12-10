@@ -703,79 +703,331 @@ def zeropower_via_newtonschulz5(G, steps=5):
         X = X.mT
     return X
 
+"""
+normuon_optimizer.py
 
-def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
-    original_shape = None
-    if update.ndim == 4:  # for the case of conv filters
-        original_shape = update.shape
-        update = update.reshape(update.size(0), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps).float()
-    if original_shape is not None:
-        update = update.reshape(original_shape)
-    ################ NorMuon added ###################
-    vnorm = update.norm(dim=(-2, -1), keepdim=True)
-    v_mean = torch.mean(update * update, dim=-1, keepdim=True)
-    second_momentum.lerp_(v_mean, 1 - beta2)
-    step_size = 1 / second_momentum.sqrt().add_(1e-10)
-    update.mul_(step_size)
-    vnorm_new = update.norm(dim=(-2, -1), keepdim=True)
-    update.mul_(vnorm / (vnorm_new.add_(1e-10)))  # This scaling keep the update norm the same as pre-normalization
-    ##################################################
-    update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
-    return update
+Single-device NorMuon + aux Adam optimizer, designed for use with
+CleanRL-style models or any PyTorch nn.Module.
+
+Implements:
+  - zeropower_via_newtonschulz5: Muon-style orthogonalization
+  - normuon_update: NorMuon 2D row-normalized update
+  - adam_update: Adam-style per-parameter update
+  - SingleDeviceNorMuonWithAuxAdam: mixed optimizer
+"""
+
+from __future__ import annotations
+
+from typing import Iterable, List, Dict, Any
+
+import math
+import torch
+from torch import Tensor
+from torch.optim import Optimizer
 
 
-# modified from https://github.com/KellerJordan/Muon/blob/master/muon.py
-class NorMuon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
-        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
-        params = sorted(params, key=lambda x: x.size(), reverse=True)
-        super().__init__(params, defaults)
+# ---------------------------------------------------------------------------
+#  Muon orthogonalization (Newton–Schulz, quintic iteration)
+# ---------------------------------------------------------------------------
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5) -> Tensor:
+    """
+    Newton–Schulz iteration to compute an orthogonalized version of G.
+    This is the Muon-style "zeroth power" iteration with a quintic polynomial.
+
+    Args:
+        G: Tensor of shape (..., m, n), m,n >= 1
+        steps: number of Newton–Schulz iterations
+
+    Returns:
+        Tensor of the same shape as G, orthogonalized along the last two dims.
+    """
+    assert G.ndim >= 2, "G must have at least 2 dimensions (matrix or batched matrices)."
+    a, b, c = (3.4445, -4.7750, 2.0315)
+
+    X = G.to(dtype=torch.bfloat16)
+    transposed = False
+    if X.size(-2) > X.size(-1):
+        X = X.mT
+        transposed = True
+
+    # Ensure spectral norm <= 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+
+    if transposed:
+        X = X.mT
+
+    return X.to(dtype=G.dtype)
+
+
+# ---------------------------------------------------------------------------
+#  NorMuon row-normalized update (2D + per-row second moment)
+# ---------------------------------------------------------------------------
+
+def normuon_update(
+    grad_2d: Tensor,
+    momentum: Tensor,
+    v_buffer: Tensor,
+    beta: float = 0.95,
+    beta2: float = 0.95,
+    ns_steps: int = 5,
+    eps: float = 1e-10,
+) -> tuple[Tensor, Tensor]:
+    """
+    NorMuon-style update on a *2D view* of a weight matrix.
+
+    Shapes:
+      grad_2d      : (m, n_flat)
+      momentum     : (m, n_flat)  -- EMA of gradients
+      v_buffer     : (m, 1)       -- row-wise second moment
+
+    Returns:
+      O_hat : (m, n_flat)  -- row-normalized orthogonal update
+      O     : (m, n_flat)  -- pre-normalization orthogonal matrix
+    """
+    # 1) First-order momentum (Muon's style)
+    momentum.lerp_(grad_2d, 1.0 - beta)
+    M = momentum  # use momentum as the effective direction (Nesterov-ish)
+
+    # 2) Orthogonalize via Muon NS iteration
+    O = zeropower_via_newtonschulz5(M, steps=ns_steps).to(dtype=grad_2d.dtype)
+
+    # 3) Row-wise second moment: v_t in R^{m x 1}
+    row_mean_sq = (O * O).mean(dim=1, keepdim=True)  # (m, 1)
+    v_buffer.lerp_(row_mean_sq, 1.0 - beta2)
+
+    # 4) Row-wise normalization
+    O_hat = O / (v_buffer.sqrt() + eps)  # (m, n_flat)
+
+    return O_hat, O
+
+
+# ---------------------------------------------------------------------------
+#  Aux Adam update (AdamW-style, but without explicit bias correction here)
+# ---------------------------------------------------------------------------
+
+def adam_update(
+    grad: Tensor,
+    exp_avg: Tensor,
+    exp_avg_sq: Tensor,
+    step: int,
+    betas: tuple[float, float],
+    eps: float,
+) -> Tensor:
+    """
+    Single-step Adam update (with bias correction).
+    """
+    beta1, beta2 = betas
+
+    exp_avg.lerp_(grad, 1.0 - beta1)
+    exp_avg_sq.lerp_(grad * grad, 1.0 - beta2)
+
+    # Bias correction
+    bias_c1 = 1.0 - beta1 ** step
+    bias_c2 = 1.0 - beta2 ** step
+
+    denom = (exp_avg_sq / bias_c2).sqrt() + eps
+    return (exp_avg / bias_c1) / denom
+
+
+# ---------------------------------------------------------------------------
+#  Single-device NorMuon + aux Adam optimizer
+# ---------------------------------------------------------------------------
+
+class SingleDeviceNorMuonWithAuxAdam(Optimizer):
+    """
+    Non-distributed NorMuon + aux Adam optimizer.
+
+    Usage pattern:
+        # Example param-group construction:
+        hidden_params = []
+        aux_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2 and not name.endswith(".bias"):
+                hidden_params.append(p)   # large matrices -> NorMuon
+            else:
+                aux_params.append(p)      # biases, LN, heads -> Adam
+
+        optimizer = SingleDeviceNorMuonWithAuxAdam([
+            dict(params=hidden_params, use_muon=True,  lr=0.02, momentum=0.95,
+                 beta2=0.95, weight_decay=0.01),
+            dict(params=aux_params,    use_muon=False, lr=3e-4,
+                 betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
+        ])
+
+    For use_muon=True param groups:
+        - NorMuon applied to 2D views of (linear + conv) weights.
+        - One (m,1) v_buffer per parameter for row-wise second moment.
+        - Global RMS scaling ala NorMuon paper:
+              eta_hat = 0.2 * lr * sqrt(m * n_flat) / ||O_hat||_F
+
+    For use_muon=False param groups:
+        - Adam-based aux path (good for biases, LN scales, small layers).
+    """
+
+    def __init__(self, param_groups: List[Dict[str, Any]]):
+        processed_groups: List[Dict[str, Any]] = []
+
+        for group in param_groups:
+            if "use_muon" not in group:
+                raise ValueError("Each param_group must include 'use_muon': True/False")
+
+            params = list(group["params"])
+            if len(params) == 0:
+                continue
+
+            if group["use_muon"]:
+                # NorMuon defaults
+                lr = group.get("lr", 0.02)
+                momentum = group.get("momentum", 0.95)
+                beta2 = group.get("beta2", 0.95)
+                weight_decay = group.get("weight_decay", 0.0)
+
+                new_group = dict(
+                    params=params,
+                    use_muon=True,
+                    lr=lr,
+                    momentum=momentum,
+                    beta2=beta2,
+                    weight_decay=weight_decay,
+                )
+                processed_groups.append(new_group)
+            else:
+                # Aux Adam defaults
+                lr = group.get("lr", 3e-4)
+                betas = group.get("betas", (0.9, 0.95))
+                eps = group.get("eps", 1e-10)
+                weight_decay = group.get("weight_decay", 0.0)
+
+                new_group = dict(
+                    params=params,
+                    use_muon=False,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=weight_decay,
+                )
+                processed_groups.append(new_group)
+
+        super().__init__(processed_groups, {})
 
     @torch.no_grad()
     def step(self, closure=None):
-
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
         for group in self.param_groups:
-            params = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * (
-                        dist.get_world_size() - len(params) % dist.get_world_size())
-            for base_i in range(len(params))[::dist.get_world_size()]:
-                if base_i + dist.get_rank() < len(params):
-                    p = params[base_i + dist.get_rank()]
-                    had_grad = p.grad is not None
-                    if not had_grad:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                        state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
-                    update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
-                                            beta=group["momentum"], beta2=group["beta2"])
-
-                    # decoupled WD (only if we had a real grad)
-                    if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-
-                    # Muon-style scale factor
-                    if p.ndim >= 2:
-                        scale = 0.2 * (max(p.size(-2), p.size(-1)) ** 0.5)
-                    else:
-                        scale = 0.2
-
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"] * scale)
-
-                dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
+            if group["use_muon"]:
+                self._step_nor_muon_group(group)
+            else:
+                self._step_aux_adam_group(group)
 
         return loss
+
+    @torch.no_grad()
+    def _step_nor_muon_group(self, group: Dict[str, Any]) -> None:
+        lr: float = group["lr"]
+        beta: float = group["momentum"]
+        beta2: float = group["beta2"]
+        wd: float = group["weight_decay"]
+
+        for p in group["params"]:
+            g = p.grad
+            if g is None:
+                continue
+
+            # Restrict NorMuon to 2D views of linear/conv weights
+            if p.ndim == 2:
+                # Linear: (m, n)
+                m, n_flat = p.shape
+                grad_2d = g
+                W_2d = p
+            elif p.ndim == 4:
+                # Conv: (out_channels, in_channels, kH, kW)
+                m = p.size(0)
+                n_flat = p[0].numel()
+                grad_2d = g.view(m, n_flat)
+                W_2d = p.view(m, n_flat)
+            else:
+                # 1D or other shapes -> skip NorMuon; rely on aux Adam for those in a different param group
+                continue
+
+            st = self.state[p]
+            if len(st) == 0:
+                st["momentum_buffer"] = torch.zeros_like(grad_2d)
+                st["v_buffer"] = torch.zeros(
+                    m, 1, device=p.device, dtype=p.dtype
+                )
+
+            mom: Tensor = st["momentum_buffer"]
+            v_buf: Tensor = st["v_buffer"]
+
+            # NorMuon 2D update (row-normalized + pre-normalization view)
+            O_hat, _ = normuon_update(
+                grad_2d,
+                mom,
+                v_buf,
+                beta=beta,
+                beta2=beta2,
+                ns_steps=5,
+                eps=1e-10,
+            )
+
+            # Global RMS-matching scale (NorMuon paper style)
+            fro_norm = O_hat.norm() + 1e-10
+            eta_hat = 0.2 * lr * math.sqrt(m * n_flat) / fro_norm
+
+            # Decoupled weight decay (if desired)
+            if wd != 0.0:
+                W_2d.mul_(1.0 - lr * wd)
+
+            # Apply update
+            W_2d.add_(O_hat, alpha=-eta_hat)
+
+            # Write back to the original tensor for convs
+            if p.ndim == 4:
+                p.copy_(W_2d.view_as(p))
+
+    @torch.no_grad()
+    def _step_aux_adam_group(self, group: Dict[str, Any]) -> None:
+        lr: float = group["lr"]
+        betas: tuple[float, float] = group["betas"]
+        eps: float = group["eps"]
+        wd: float = group["weight_decay"]
+
+        for p in group["params"]:
+            g = p.grad
+            if g is None:
+                continue
+
+            st = self.state[p]
+            if len(st) == 0:
+                st["exp_avg"] = torch.zeros_like(p)
+                st["exp_avg_sq"] = torch.zeros_like(p)
+                st["step"] = 0
+
+            st["step"] += 1
+            step_num = st["step"]
+            exp_avg: Tensor = st["exp_avg"]
+            exp_avg_sq: Tensor = st["exp_avg_sq"]
+
+            # Adam-like update
+            upd = adam_update(g, exp_avg, exp_avg_sq, step_num, betas, eps)
+
+            if wd != 0.0:
+                p.mul_(1.0 - lr * wd)
+
+            p.add_(upd, alpha=-lr)
+
 
 
 def adam_update(grad, buf1, buf2, step, betas, eps):
