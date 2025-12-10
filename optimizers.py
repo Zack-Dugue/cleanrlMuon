@@ -760,9 +760,19 @@ class NorMuon(torch.optim.Optimizer):
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                             beta=group["momentum"], beta2=group["beta2"])
+
+                    # decoupled WD (only if we had a real grad)
                     if group["weight_decay"] and had_grad:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+                    # Muon-style scale factor
+                    if p.ndim >= 2:
+                        scale = 0.2 * (max(p.size(-2), p.size(-1)) ** 0.5)
+                    else:
+                        scale = 0.2
+
+                    p.add_(update.reshape(p.shape), alpha=-group["lr"] * scale)
+
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
         return loss
