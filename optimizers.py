@@ -2,6 +2,16 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 import math
+
+from __future__ import annotations
+
+from typing import Iterable, List, Dict, Any
+
+import math
+import torch
+from torch import Tensor
+from torch.optim import Optimizer
+
 # ----- your existing zeropower_via_newtonschulz5 -----
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     assert G.ndim >= 2
@@ -703,27 +713,7 @@ def zeropower_via_newtonschulz5(G, steps=5):
         X = X.mT
     return X
 
-"""
-normuon_optimizer.py
 
-Single-device NorMuon + aux Adam optimizer, designed for use with
-CleanRL-style models or any PyTorch nn.Module.
-
-Implements:
-  - zeropower_via_newtonschulz5: Muon-style orthogonalization
-  - normuon_update: NorMuon 2D row-normalized update
-  - adam_update: Adam-style per-parameter update
-  - SingleDeviceNorMuonWithAuxAdam: mixed optimizer
-"""
-
-from __future__ import annotations
-
-from typing import Iterable, List, Dict, Any
-
-import math
-import torch
-from torch import Tensor
-from torch.optim import Optimizer
 
 
 # ---------------------------------------------------------------------------
