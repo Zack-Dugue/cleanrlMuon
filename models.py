@@ -227,3 +227,108 @@ class Agent(nn.Module):
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+
+
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions.categorical import Categorical
+
+
+class SimpleAgent(nn.Module):
+    """
+    Simple MLP actor-critic.
+
+    Muon routing rule:
+      - ONLY the hidden -> hidden linear weights use Muon
+      - input -> hidden weights do NOT use Muon
+      - hidden -> output weights do NOT use Muon
+      - all biases / norm params use Adam
+    """
+    def __init__(self, envs, hidden_dim=128):
+        super().__init__()
+
+        obs_dim = int(np.prod(envs.single_observation_space.shape))
+        action_dim = envs.single_action_space.n
+
+        # ----- critic -----
+        self.critic_in = layer_init(nn.Linear(obs_dim, hidden_dim))
+        self.critic_ln1 = nn.LayerNorm(hidden_dim)
+        self.critic_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
+        self.critic_ln2 = nn.LayerNorm(hidden_dim)
+        self.critic_out = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
+
+        # ----- actor -----
+        self.actor_in = layer_init(nn.Linear(obs_dim, hidden_dim))
+        self.actor_ln1 = nn.LayerNorm(hidden_dim)
+        self.actor_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
+        self.actor_ln2 = nn.LayerNorm(hidden_dim)
+        self.actor_out = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
+
+        self.act = nn.GELU()
+
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"[SimpleAgent] obs_dim={obs_dim:,}, hidden_dim={hidden_dim}, action_dim={action_dim}")
+        print(f"[SimpleAgent] total parameters: {total_params:,}")
+
+    def _flatten_obs(self, x):
+        # Match your other agent's preprocessing style.
+        x = x.float()
+        if x.ndim > 2:
+            x = x.view(x.shape[0], -1)
+            x = x / 255.0
+        return x
+
+    def _critic_features(self, x):
+        x = self._flatten_obs(x)
+        x = self.critic_in(x)     # input -> hidden (NOT Muon)
+        x = self.critic_ln1(x)
+        x = self.act(x)
+        x = self.critic_mid(x)    # hidden -> hidden (Muon)
+        x = self.critic_ln2(x)
+        x = self.act(x)
+        return x
+
+    def _actor_features(self, x):
+        x = self._flatten_obs(x)
+        x = self.actor_in(x)      # input -> hidden (NOT Muon)
+        x = self.actor_ln1(x)
+        x = self.act(x)
+        x = self.actor_mid(x)     # hidden -> hidden (Muon)
+        x = self.actor_ln2(x)
+        x = self.act(x)
+        return x
+
+    def get_split_params(self):
+        """
+        Only hidden->hidden weight matrices go to Muon.
+        Everything else goes to Adam.
+        """
+        muon_params = [
+            self.actor_mid.weight,
+            self.critic_mid.weight,
+        ]
+
+        muon_ids = {id(p) for p in muon_params}
+        adam_params = [p for p in self.parameters() if id(p) not in muon_ids]
+
+        return muon_params, adam_params
+
+    def get_value(self, x):
+        x = self._critic_features(x)
+        return self.critic_out(x)
+
+    def get_action_and_value(self, x, action=None):
+        actor_x = self._actor_features(x)
+        logits = self.actor_out(actor_x)
+
+        probs = Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+
+        critic_x = self._critic_features(x)
+        value = self.critic_out(critic_x)
+
+        return action, probs.log_prob(action), probs.entropy(), value
