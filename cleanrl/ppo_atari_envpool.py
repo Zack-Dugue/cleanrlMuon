@@ -186,7 +186,7 @@ if __name__ == "__main__":
         param_groups = [
             dict(params=muon_params, lr=args.learning_rate, momentum=args.momentum,
                  weight_decay=1e-4, use_muon=True, ns_steps=ns_steps),
-            dict(params=aux_params, lr=args.learning_rate, momentum=args.momentum,
+            dict(params=aux_params, lr=args.learning_rate/300, momentum=args.momentum,
                  weight_decay=1e-4, use_muon=False),
         ]
         optimizer = MuonWithAuxAdam(param_groups)

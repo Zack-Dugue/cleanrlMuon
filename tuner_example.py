@@ -60,7 +60,6 @@ TARGET_SCORES: Dict[str, Optional[List[float]]] = {
     "Gravitar-v5":          [0.0, 1000.0],
 }
 
-
 def default_params_fn(optimizer_name: str):
     """
     Closure that captures the fixed optimizer string and returns an Optuna params_fn.
@@ -71,7 +70,7 @@ def default_params_fn(optimizer_name: str):
             # Tunables (kebab-case flags as expected by your CleanRL script)
             "learning-rate": trial.suggest_float("lr", 3e-5, 3e-3, log=True),
             "ent-coef": trial.suggest_float("ent_coef", 0.0, 0.02),
-            "update-epochs": trial.suggest_int("update_epochs", 2, 8),
+            "update-epochs": trial.suggest_int("update_epochs", 5, 5),
             "momentum": trial.suggest_float("momentum", 0.7, 0.99),
 
             # Fixed batch shape / run length
