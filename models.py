@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-
+from torchrl import BatchRenorm1d
 # -------- utils --------
 def layer_init(layer, std=math.sqrt(2), bias_const=0.0):
     nn.init.orthogonal_(layer.weight, gain=std)
@@ -434,12 +434,12 @@ class BetterSimpleAgent(nn.Module):
         This avoids updating BatchRenorm stats more than once per shared forward.
         """
         x = self.critic_in(x)
-        x = self.critic_ln1(x)
         x = self.act(x)
+        x = self.critic_ln1(x)
 
         x = self.critic_mid(x)
-        x = self.critic_ln2(x)
         x = self.act(x)
+        x = self.critic_ln2(x)
 
         return x
 
@@ -449,12 +449,12 @@ class BetterSimpleAgent(nn.Module):
         This avoids updating BatchRenorm stats more than once per shared forward.
         """
         x = self.actor_in(x)
-        x = self.actor_ln1(x)
         x = self.act(x)
+        x = self.actor_ln1(x)
 
         x = self.actor_mid(x)
-        x = self.actor_ln2(x)
         x = self.act(x)
+        x = self.actor_ln2(x)
 
         return x
 
