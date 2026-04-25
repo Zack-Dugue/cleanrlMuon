@@ -332,3 +332,211 @@ class SimpleAgent(nn.Module):
         value = self.critic_out(critic_x)
 
         return action, probs.log_prob(action), probs.entropy(), value
+
+
+
+class BetterSimpleAgent(nn.Module):
+    """
+    Simple MLP actor-critic.
+
+    Normalization:
+      - Flattened raw input is normalized with TorchRL BatchRenorm1d.
+      - TorchRL BatchRenorm1d keeps affine parameters by default.
+      - Hidden LayerNorms use elementwise_affine=False.
+
+    Muon routing rule by default:
+      - hidden -> hidden linear weights use Muon
+      - input -> hidden weights use Adam unless use_muon_input=True
+      - hidden -> output weights use Adam unless use_muon_output=True
+      - all biases / norm params always use Adam
+    """
+
+    def __init__(
+        self,
+        envs,
+        hidden_dim=128,
+        *,
+        use_muon_input=False,
+        use_muon_output=False,
+        brn_eps=1e-5,
+        brn_momentum=0.01,
+        brn_max_r=3.0,
+        brn_max_d=5.0,
+        brn_warmup_steps=10_000,
+        brn_smooth=False,
+    ):
+        super().__init__()
+
+        self.use_muon_input = use_muon_input
+        self.use_muon_output = use_muon_output
+
+        obs_dim = int(np.prod(envs.single_observation_space.shape))
+        action_dim = envs.single_action_space.n
+
+        # TorchRL BatchRenorm1d has affine parameters internally:
+        #   input_brn.weight
+        #   input_brn.bias
+        #
+        # It expects the feature dimension to be dim=1.
+        # For flattened observations, x has shape [batch, obs_dim].
+        self.input_brn = BatchRenorm1d(
+            obs_dim,
+            eps=brn_eps,
+            momentum=brn_momentum,
+            max_r=brn_max_r,
+            max_d=brn_max_d,
+            warmup_steps=brn_warmup_steps,
+            smooth=brn_smooth,
+        )
+
+        # ----- critic -----
+        self.critic_in = layer_init(nn.Linear(obs_dim, hidden_dim))
+        self.critic_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+
+        self.critic_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
+        self.critic_ln2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+
+        self.critic_out = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
+
+        # ----- actor -----
+        self.actor_in = layer_init(nn.Linear(obs_dim, hidden_dim))
+        self.actor_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+
+        self.actor_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
+        self.actor_ln2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+
+        self.actor_out = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
+
+        self.act = nn.GELU()
+
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"[SimpleAgent] obs_dim={obs_dim:,}, hidden_dim={hidden_dim}, action_dim={action_dim}")
+        print(f"[SimpleAgent] total parameters: {total_params:,}")
+        print(f"[SimpleAgent] use_muon_input={use_muon_input}, use_muon_output={use_muon_output}")
+
+    def _flatten_obs(self, x):
+        x = x.float()
+
+        if x.ndim > 2:
+            x = x.view(x.shape[0], -1)
+            x = x / 255.0
+
+        return x
+
+    def _normalize_input(self, x):
+        x = self._flatten_obs(x)
+        x = self.input_brn(x)
+        return x
+
+    def _critic_features_from_normalized(self, x):
+        """
+        x should already be flattened + BatchRenorm-normalized.
+        This avoids updating BatchRenorm stats more than once per shared forward.
+        """
+        x = self.critic_in(x)
+        x = self.critic_ln1(x)
+        x = self.act(x)
+
+        x = self.critic_mid(x)
+        x = self.critic_ln2(x)
+        x = self.act(x)
+
+        return x
+
+    def _actor_features_from_normalized(self, x):
+        """
+        x should already be flattened + BatchRenorm-normalized.
+        This avoids updating BatchRenorm stats more than once per shared forward.
+        """
+        x = self.actor_in(x)
+        x = self.actor_ln1(x)
+        x = self.act(x)
+
+        x = self.actor_mid(x)
+        x = self.actor_ln2(x)
+        x = self.act(x)
+
+        return x
+
+    def _critic_features(self, x):
+        """
+        Convenience path for value-only calls.
+        This updates BatchRenorm once.
+        """
+        x = self._normalize_input(x)
+        return self._critic_features_from_normalized(x)
+
+    def _actor_features(self, x):
+        """
+        Convenience path for actor-only calls.
+        This updates BatchRenorm once.
+        """
+        x = self._normalize_input(x)
+        return self._actor_features_from_normalized(x)
+
+    def get_split_params(self):
+        """
+        Returns:
+            muon_params, adam_params
+
+        By default, only hidden -> hidden matrix weights go to Muon.
+
+        Optional:
+            use_muon_input=True
+                sends actor_in.weight and critic_in.weight to Muon.
+
+            use_muon_output=True
+                sends actor_out.weight and critic_out.weight to Muon.
+
+        Biases, BatchRenorm params, and LayerNorm params always remain Adam-side.
+        """
+
+        muon_params = [
+            self.actor_mid.weight,
+            self.critic_mid.weight,
+        ]
+
+        if self.use_muon_input:
+            muon_params.extend([
+                self.actor_in.weight,
+                self.critic_in.weight,
+            ])
+
+        if self.use_muon_output:
+            muon_params.extend([
+                self.actor_out.weight,
+                self.critic_out.weight,
+            ])
+
+        muon_ids = {id(p) for p in muon_params}
+
+        adam_params = [
+            p for p in self.parameters()
+            if id(p) not in muon_ids
+        ]
+
+        return muon_params, adam_params
+
+    def get_value(self, x):
+        # Normalizes input once.
+        critic_x = self._critic_features(x)
+        return self.critic_out(critic_x)
+
+    def get_action_and_value(self, x, action=None):
+        # Important:
+        # BatchRenorm is applied once here and the same normalized input is reused
+        # by both actor and critic. This avoids updating running stats twice.
+        x = self._normalize_input(x)
+
+        actor_x = self._actor_features_from_normalized(x)
+        logits = self.actor_out(actor_x)
+
+        probs = Categorical(logits=logits)
+
+        if action is None:
+            action = probs.sample()
+
+        critic_x = self._critic_features_from_normalized(x)
+        value = self.critic_out(critic_x)
+
+        return action, probs.log_prob(action), probs.entropy(), value
