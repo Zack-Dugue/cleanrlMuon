@@ -362,8 +362,8 @@ class BetterSimpleAgent(nn.Module):
         brn_momentum=0.01,
         brn_max_r=3.0,
         brn_max_d=5.0,
-        brn_warmup_steps=10_000,
-        brn_smooth=False,
+        brn_warmup_steps=1000,
+        brn_smooth=True,
     ):
         super().__init__()
 
