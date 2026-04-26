@@ -12,7 +12,8 @@ Example:
     --optimizer adamw \
     --trials 40 \
     --seeds 3 \
-    --study-name atari10_envpool_adamw
+    --study-name atari10_envpool_adamw \
+    --wandb-tag muon_input
 
 Notes:
 - Make sure `cleanrl/ppo_atari_envpool.py` is your EnvPool-based script that accepts:
@@ -105,6 +106,8 @@ def main():
     p.add_argument("--logs-root", type=str, default="tuner_logs")
     p.add_argument("--metric-window", type=int, default=50,
                    help="Average last N scalars from TB for the metric.")
+    p.add_argument("--wandb-tag", type=str, default=None,
+                   help="Optional WandB tag for grouping/filtering runs.")
     args = p.parse_args()
 
     gpu_list = [int(x) for x in args.gpus.split(",") if x.strip()]
@@ -124,6 +127,7 @@ def main():
         study_name=args.study_name,
         wandb_kwargs={},  # fill to enable Weights & Biases
         logs_root=args.logs_root,
+        wandb_tag=args.wandb_tag,
     )
 
     best = tuner.tune(num_trials=args.trials, num_seeds=args.seeds)

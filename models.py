@@ -354,7 +354,7 @@ class BetterSimpleAgent(nn.Module):
     def __init__(
         self,
         envs,
-        hidden_dim=128,
+        hidden_dim=256,
         *,
         use_muon_input=False,
         use_muon_output=False,
@@ -391,16 +391,16 @@ class BetterSimpleAgent(nn.Module):
 
         # ----- critic -----
         self.critic_in = layer_init(nn.Linear(obs_dim, hidden_dim))
-        self.critic_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.critic_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=True)
 
         self.critic_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
-        self.critic_ln2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.critic_ln2 = nn.LayerNorm(hidden_dim, elementwise_affine=True)
 
         self.critic_out = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
 
         # ----- actor -----
         self.actor_in = layer_init(nn.Linear(obs_dim, hidden_dim))
-        self.actor_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.actor_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=True)
 
         self.actor_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
         self.actor_ln2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
@@ -434,12 +434,14 @@ class BetterSimpleAgent(nn.Module):
         This avoids updating BatchRenorm stats more than once per shared forward.
         """
         x = self.critic_in(x)
-        x = self.act(x)
         x = self.critic_ln1(x)
+        x = self.act(x)
+
 
         x = self.critic_mid(x)
-        x = self.act(x)
         x = self.critic_ln2(x)
+        x = self.act(x)
+
 
         return x
 
@@ -449,12 +451,13 @@ class BetterSimpleAgent(nn.Module):
         This avoids updating BatchRenorm stats more than once per shared forward.
         """
         x = self.actor_in(x)
-        x = self.act(x)
         x = self.actor_ln1(x)
+        x = self.act(x)
 
-        x = self.actor_mid(x)
+
         x = self.act(x)
         x = self.actor_ln2(x)
+        x = self.actor_mid(x)
 
         return x
 

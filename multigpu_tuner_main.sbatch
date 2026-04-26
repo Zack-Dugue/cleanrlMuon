@@ -16,13 +16,14 @@
 set -eo pipefail
 
 # ── (0) Config you can tweak right here ───────────────────────────────────────
-OPTIMIZER="Muon"                     # ← choose: adamw | adam | muon | etc. (your script handles it)
-GPUS="0,1,2,3,4,5,6,7"                            # local GPU indices (Slurm masks devices per node)
+OPTIMIZER="Muon"                              # ← choose: adamw | adam | muon | etc. (your script handles it)
+GPUS="0,1,2,3,4,5,6,7"                        # local GPU indices (Slurm masks devices per node)
 TRIALS=20
 SEEDS=3
 STUDY_NAME="atari10_envpool_${OPTIMIZER}"
+WANDB_TAG="muon_input"                        # ← put your WandB tag here (or set to "" for none)
 LOGS_ROOT="logs"
-STORAGE_URL="sqlite:///cleanrl_hpopt.db"    # use MySQL/Postgres for multi-node
+STORAGE_URL="sqlite:///cleanrl_hpopt.db"     # use MySQL/Postgres for multi-node
 
 # Path to your EnvPool-based CleanRL script
 SCRIPT="cleanrl/ppo_atari_envpool.py"
@@ -69,8 +70,8 @@ cd "${SLURM_SUBMIT_DIR}"
 
 # ── (4) Launch tuner_example.py ───────────────────────────────────────────────
 # tuner_example.py internally defines the 10 Atari v5 games and their normalization.
-# It expects a CleanRL EnvPool entry point at --script and forwards --optimizer.
-echo "[info] Starting tuner_example.py with optimizer=${OPTIMIZER}"
+# It expects a CleanRL EnvPool entry point at --script and forwards --optimizer and --wandb-tag.
+echo "[info] Starting tuner_example.py with optimizer=${OPTIMIZER} and wandb_tag=${WANDB_TAG}"
 srun python -u tuner_example.py \
   --script "${SCRIPT}" \
   --gpus "${GPUS}" \
@@ -79,6 +80,7 @@ srun python -u tuner_example.py \
   --seeds ${SEEDS} \
   --study-name "${STUDY_NAME}" \
   --storage "${STORAGE_URL}" \
-  --logs-root "${LOGS_ROOT}"
+  --logs-root "${LOGS_ROOT}" \
+  --wandb-tag "${WANDB_TAG}"
 
 echo "Job finished on $(date)"
