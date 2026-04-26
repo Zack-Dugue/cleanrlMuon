@@ -1,3 +1,167 @@
+"""
+multi_gpu_tuner.py — DEBUG LOGGING EDITION (Fail-Fast Enhanced + .trk progress)
+
+Adds a third log file type ".trk" that appends a one-line progress record whenever
+a single env run completes (i.e., one (env_id, seed) finishes on some GPU).
+
+Example .trk line:
+  2025-11-02 12:34:56 | done 7/120 | elapsed 00:03:41 | trial 3 seed 0 env Pong-v5
+
+Use:
+  watch -n 1 tail -n 20 tuner_logs/<study_name>/<study_name>.trk
+"""
+
+from __future__ import annotations
+import os, sys, time, math, glob, runpy, traceback, logging, threading, socket
+from logging.handlers import RotatingFileHandler
+from typing import Callable, Dict, List, Optional, Tuple
+import numpy as np, optuna
+from tensorboard.backend.event_processing import event_accumulator
+from multiprocessing import get_context
+
+try:
+    import wandb
+except Exception:
+    wandb = None
+
+# ───────────────────────── Logging setup ─────────────────────────
+
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def _setup_logger(name: str, log_file: str, level: int, to_stdout: bool = True) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(processName)s[%(process)d] | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3)
+    fh.setFormatter(fmt)
+    fh.setLevel(level)
+    logger.addHandler(fh)
+    if to_stdout:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        sh.setLevel(level)
+        logger.addHandler(sh)
+    return logger
+
+def _get_log_level_from_env(default="DEBUG") -> int:
+    return {
+        "CRITICAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+        "NOTSET": logging.NOTSET,
+    }.get(os.getenv("LOG_LEVEL", default).upper(), logging.DEBUG)
+
+MAIN_LOGGER: Optional[logging.Logger] = None
+WORKER_LOGGER: Optional[logging.Logger] = None
+
+# ───────────────────────── Helper utilities ─────────────────────────
+
+def _round_robin_split(items: List[str], n: int) -> List[List[str]]:
+    buckets = [[] for _ in range(n)]
+    for i, it in enumerate(items):
+        buckets[i % n].append(it)
+    return buckets
+
+def _latest_runs_subdir(after_ts: float, base_dir="runs", grace_s: float = 0.0) -> Optional[str]:
+    try:
+        candidates = []
+        for d in glob.glob(os.path.join(base_dir, "*")):
+            try:
+                mtime = os.path.getmtime(d)
+                if mtime >= (after_ts - grace_s) and os.path.isdir(d):
+                    candidates.append((mtime, d))
+            except Exception:
+                pass
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return os.path.basename(candidates[0][1])
+    except Exception:
+        return None
+
+def _hhmmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, r = divmod(seconds, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+_WORKER_GPU = None
+_WORKER_THREADS = None
+
+def _init_worker(gpu_id: int, threads: int, study_name: str, logs_root: str, level: int):
+    global _WORKER_GPU, _WORKER_THREADS, WORKER_LOGGER
+    _WORKER_GPU = gpu_id
+    _WORKER_THREADS = threads
+    os.environ.update({
+        "CUDA_VISIBLE_DEVICES": str(gpu_id),
+        "OMP_NUM_THREADS": str(threads),
+        "MKL_NUM_THREADS": str(threads),
+        "OPENBLAS_NUM_THREADS": str(threads),
+        "NUMEXPR_MAX_THREADS": str(threads),
+        "BLIS_NUM_THREADS": str(threads),
+    })
+    worker_log_dir = os.path.join(logs_root, study_name)
+    _ensure_dir(worker_log_dir)
+    log_file = os.path.join(worker_log_dir, f"gpu{gpu_id}-worker.log")
+    WORKER_LOGGER = _setup_logger(f"worker.gpu{gpu_id}", log_file, level, to_stdout=False)
+    WORKER_LOGGER.info(f"Worker initialized on GPU {gpu_id}, threads={threads}")
+
+def _read_tb_metric(logdir: str, metric: str, last_n: int,
+                    retries: int = 5, sleep_s: float = 0.5,
+                    logger: Optional[logging.Logger] = None) -> float:
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            if logger: logger.debug(f"[TB] Attempt {attempt}/{retries}: {logdir}")
+            ea = event_accumulator.EventAccumulator(logdir)
+            ea.Reload()
+            scalars = ea.Scalars(metric)
+            if not scalars:
+                raise FileNotFoundError(f"Metric '{metric}' not found")
+            vals = [e.value for e in scalars[-last_n:]] if last_n > 0 else [e.value for e in scalars]
+            return float(np.average(vals))
+        except Exception as e:
+            last_err = e
+            if logger: logger.warning(f"[TB] Read failed (attempt {attempt}): {e}")
+            time.sleep(sleep_s)
+    if logger: logger.error(f"[TB] Failed after {retries} attempts\n{traceback.format_exc()}")
+    raise last_err if last_err else RuntimeError(f"TB metric {metric} read failed")
+
+def _run_one_env(env_id: str, script: str, metric: str, algo_argv: List[str], seed: int,
+                 tb_window: int, study_name: str, logs_root: str, level: int) -> Tuple[str, float, str]:
+    logger = WORKER_LOGGER or _setup_logger(
+        "worker.fallback", os.path.join(logs_root, study_name, "worker-fallback.log"), level, to_stdout=False)
+    argv = algo_argv + [f"--env-id={env_id}", f"--seed={seed}"]
+    sys.argv = argv
+    logger.info(f"[RUN] env='{env_id}' seed={seed} GPU={_WORKER_GPU}")
+    start_ts = time.time()
+    try:
+        g = runpy.run_path(path_name=script, run_name="__main__")
+    except SystemExit as e:
+        logger.warning(f"[RUN] SystemExit({e.code}) caught")
+        g = {}
+    except Exception:
+        logger.error(f"[RUN] Exception:\n{traceback.format_exc()}")
+        raise
+    run_name = g.get("run_name") or _latest_runs_subdir(after_ts=start_ts, base_dir="runs", grace_s=1.0)
+    if not run_name:
+        logger.error("[RUN] run_name not found")
+        raise RuntimeError("run_name not found")
+    logdir = os.path.join("runs", run_name)
+    metric_val = _read_tb_metric(logdir, metric, tb_window, logger=logger)
+    logger.info(f"[DONE] {env_id}={metric_val:.6f} ({time.time()-start_ts:.2f}s)")
+    return env_id, metric_val, run_name
+
+# ───────────────────────── Tuner ─────────────────────────
 class MultiGPUTuner:
     def __init__(self, script: str, metric: str, gpus: List[int],
                  target_scores: Dict[str, Optional[List[float]]],
@@ -221,3 +385,46 @@ class MultiGPUTuner:
                 MAIN_LOGGER.info("No trials completed.")
         MAIN_LOGGER.info(f"BEST TRIAL: value={study.best_trial.value} params={study.best_trial.params}")
         return study.best_trial
+
+# ───────────────────────── CLI ─────────────────────────
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--script", required=True)
+    parser.add_argument("--metric", required=True)
+    parser.add_argument("--gpus", required=True)
+    parser.add_argument("--envs", required=True, nargs="+")
+    parser.add_argument("--norms", default="")
+    parser.add_argument("--trials", type=int, default=4)
+    parser.add_argument("--seeds", type=int, default=2)
+    parser.add_argument("--logs-root", default="tuner_logs")
+    args = parser.parse_args()
+
+    def _params_fn(_trial: optuna.Trial) -> Dict:
+        return {
+            "total-timesteps": int(1e6),
+            "learning-rate": _trial.suggest_float("learning-rate", 1e-4, 3e-3, log=True),
+        }
+
+    gpu_list = [int(x) for x in args.gpus.split(",") if x.strip()]
+    target_scores: Dict[str, Optional[List[float]]] = {e: None for e in args.envs}
+    if args.norms:
+        for chunk in args.norms.split(","):
+            if not chunk: continue
+            env, lo, hi = chunk.split(":")
+            target_scores[env] = [float(lo), float(hi)]
+
+    tuner = MultiGPUTuner(
+        script=args.script, metric=args.metric,
+        gpus=gpu_list, target_scores=target_scores,
+        params_fn=_params_fn, direction="maximize",
+        aggregation_type="average", metric_last_n_average_window=50,
+        sampler=optuna.samplers.TPESampler(seed=123),
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
+        storage="sqlite:///cleanrl_hpopt.db",
+        study_name="cli_multi_gpu_tuner", wandb_kwargs={},
+        logs_root=args.logs_root,
+    )
+
+    best = tuner.tune(num_trials=args.trials, num_seeds=args.seeds)
+    print("Best:", best.value, best.params)
