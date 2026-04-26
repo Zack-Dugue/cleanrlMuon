@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from torchrl import BatchRenorm1d
+from torchrl.Module import BatchRenorm1d
 # -------- utils --------
 def layer_init(layer, std=math.sqrt(2), bias_const=0.0):
     nn.init.orthogonal_(layer.weight, gain=std)
