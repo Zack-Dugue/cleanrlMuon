@@ -41,9 +41,7 @@ ATARI10: List[str] = [
     "Seaquest-v5",
     "SpaceInvaders-v5",
     "MsPacman-v5",
-    "MontezumaRevenge-v5",
     "Assault-v5",
-    "Gravitar-v5",
 ]
 
 # Rough normalization windows (min, max) for episodic return.
@@ -56,9 +54,7 @@ TARGET_SCORES: Dict[str, Optional[List[float]]] = {
     "Seaquest-v5":          [0.0, 50000.0],
     "SpaceInvaders-v5":     [0.0, 2000.0],
     "MsPacman-v5":          [0.0, 15000.0],
-    "MontezumaRevenge-v5":  [0.0, 10000.0],
     "Assault-v5":           [0.0, 5000.0],
-    "Gravitar-v5":          [0.0, 1000.0],
 }
 
 def default_params_fn(optimizer_name: str):
