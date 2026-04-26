@@ -194,7 +194,7 @@ if __name__ == "__main__":
         muon_params, aux_params = agent.get_split_params()
         param_groups = [
             dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
-            dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
+            dict(params=aux_params, lr=args.learning_rate/300, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
     elif args.optimizer == "BGD":
