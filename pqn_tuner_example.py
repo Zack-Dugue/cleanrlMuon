@@ -68,7 +68,6 @@ def default_params_fn(
             "optimizer": optimizer_name,
 
             # W&B settings for the spawned training runs
-            "track": track,
             "wandb-project-name": wandb_project_name,
         }
         if wandb_entity is not None:

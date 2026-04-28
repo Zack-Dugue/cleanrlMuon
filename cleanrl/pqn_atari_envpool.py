@@ -136,7 +136,7 @@ if __name__ == "__main__":
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    if args.track:
+    if True:
         import wandb
 
         wandb.init(
