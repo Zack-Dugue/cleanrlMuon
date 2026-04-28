@@ -232,7 +232,7 @@ if __name__ == "__main__":
 
     # model
     # agent = BetterSimpleAgent(envs,use_muon_input=True).to(device)
-    agent = Agent(envs)
+    agent = Agent(envs).to(device)
     MC_Method = False
 
     # -------- Optimizer selection (mirrors your PPO Atari code) --------
