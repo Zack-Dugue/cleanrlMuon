@@ -56,37 +56,38 @@ TARGET_SCORES: Dict[str, Optional[List[float]]] = {
     "MsPacman-v5":          [0.0, 15000.0],
     "Assault-v5":           [0.0, 5000.0],
 }
-
 def default_params_fn(optimizer_name: str):
     """
     Closure that captures the fixed optimizer string and returns an Optuna params_fn.
     The tuner will inject --env-id and --seed for each run.
     """
     def _fn(trial: optuna.Trial) -> dict:
+        if optimizer_name in ["Muon", "NorMuon", "AdaMuon"]:
+            learning_rate = trial.suggest_float("lr", 3e-4, 3e-2, log=True)
+        else:
+            learning_rate = trial.suggest_float("lr", 3e-5, 3e-3, log=True)
+
         return {
-            # Tunables (kebab-case flags as expected by your CleanRL script)
-            "learning-rate": trial.suggest_float("lr", 3e-5, 3e-3, log=True),
-            "ent-coef": trial.suggest_float("ent_coef", 0.0, 0.02),
-            "update-epochs": trial.suggest_int("update_epochs", 5, 5),
+            # Tunables
+            "learning-rate": learning_rate,
             "momentum": trial.suggest_float("momentum", 0.9, 0.99),
+            "exploration-fraction": trial.suggest_float("exploration_fraction", 0.03, 0.20),
+            "q-lambda": trial.suggest_float("q_lambda", 0.45, 0.85),
 
             # Fixed batch shape / run length
             "num-envs": 32,
             "num-steps": 256,               # total batch: 8192
             "total-timesteps": 5_000_000,
 
-            # Fixed (not tuned) — passed through to the training script
+            # Fixed (not tuned)
             "optimizer": optimizer_name,
-
-            # If your script needs an explicit switch for EnvPool, add it here, e.g.:
-            # "env-backend": "envpool",  # Only if your script expects this flag
         }
     return _fn
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--script", type=str, default="cleanrl/ppo_atari_envpool.py",
+    p.add_argument("--script", type=str, default="cleanrl/pqn_atari_envpool.py",
                    help="Path to the EnvPool-based CleanRL script.")
     p.add_argument("--metric", type=str, default="charts/episodic_return",
                    help="TensorBoard scalar to read.")
