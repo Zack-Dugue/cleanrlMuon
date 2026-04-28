@@ -103,6 +103,7 @@ class Agent(nn.Module):
             nn.ReLU(),
             layer_init(nn.Linear(448, envs.single_action_space.n), std=0.01),
         )
+        self.critic_ext = layer_init(nn.Linear(448, 1), std=0.01)
 
 
     def get_action_and_value(self, x, action=None):
