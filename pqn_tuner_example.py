@@ -4,27 +4,13 @@ atari10_tune_envpool.py
 - Uses MultiGPUTuner (your fail-fast, spawn-safe tuner).
 - Passes a fixed --optimizer STRING down to the training script (not tuned).
 - Normalizes episodic returns with rough per-game ranges (adjust as you like).
-
-Example:
-  python atari10_tune_envpool.py \
-    --script cleanrl/ppo_atari_envpool.py \
-    --gpus 0,1 \
-    --optimizer adamw \
-    --trials 40 \
-    --seeds 3 \
-    --study-name atari10_envpool_adamw \
-    --wandb-tag muon_input
-
-Notes:
-- Make sure `cleanrl/ppo_atari_envpool.py` is your EnvPool-based script that accepts:
-    --env-id (set by the tuner)
-    --optimizer (this script passes it through)
-    --learning-rate, --ent-coef, --update-epochs, --momentum, --num-envs, --num-steps, --total-timesteps
-- The metric read is "charts/episodic_return" from TensorBoard logs under runs/<run_name>.
+- Saves the best trial to text/JSON files under <logs_root>/<study_name>/.
 """
 
 from __future__ import annotations
 import argparse
+import json
+import os
 from typing import Dict, Optional, List
 
 import optuna
@@ -56,6 +42,8 @@ TARGET_SCORES: Dict[str, Optional[List[float]]] = {
     "MsPacman-v5":          [0.0, 15000.0],
     "Assault-v5":           [0.0, 5000.0],
 }
+
+
 def default_params_fn(optimizer_name: str):
     """
     Closure that captures the fixed optimizer string and returns an Optuna params_fn.
@@ -83,6 +71,47 @@ def default_params_fn(optimizer_name: str):
             "optimizer": optimizer_name,
         }
     return _fn
+
+
+def save_best_trial(best, study_name: str, logs_root: str, optimizer_name: str, script: str, metric: str,
+                    trials: int, seeds: int, gpu_list: List[int]):
+    study_dir = os.path.join(logs_root, study_name)
+    os.makedirs(study_dir, exist_ok=True)
+
+    txt_path = os.path.join(study_dir, "best_hyperparams.txt")
+    json_path = os.path.join(study_dir, "best_hyperparams.json")
+
+    payload = {
+        "study_name": study_name,
+        "optimizer": optimizer_name,
+        "script": script,
+        "metric": metric,
+        "trials_requested": int(trials),
+        "seeds_per_trial": int(seeds),
+        "gpus": list(gpu_list),
+        "best_value": float(best.value),
+        "best_trial_number": int(best.number),
+        "best_params": dict(best.params),
+    }
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(f"study_name: {payload['study_name']}\n")
+        f.write(f"optimizer: {payload['optimizer']}\n")
+        f.write(f"script: {payload['script']}\n")
+        f.write(f"metric: {payload['metric']}\n")
+        f.write(f"trials_requested: {payload['trials_requested']}\n")
+        f.write(f"seeds_per_trial: {payload['seeds_per_trial']}\n")
+        f.write(f"gpus: {payload['gpus']}\n")
+        f.write(f"best_trial_number: {payload['best_trial_number']}\n")
+        f.write(f"best_value: {payload['best_value']}\n")
+        f.write("best_params:\n")
+        for k, v in payload["best_params"].items():
+            f.write(f"  {k}: {v}\n")
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    return txt_path, json_path
 
 
 def main():
@@ -128,7 +157,20 @@ def main():
     )
 
     best = tuner.tune(num_trials=args.trials, num_seeds=args.seeds)
+    txt_path, json_path = save_best_trial(
+        best=best,
+        study_name=args.study_name,
+        logs_root=args.logs_root,
+        optimizer_name=args.optimizer,
+        script=args.script,
+        metric=args.metric,
+        trials=args.trials,
+        seeds=args.seeds,
+        gpu_list=gpu_list,
+    )
     print("Best:", best.value, best.params)
+    print(f"Saved best hyperparameters to: {txt_path}")
+    print(f"Saved best hyperparameters JSON to: {json_path}")
 
 
 if __name__ == "__main__":
