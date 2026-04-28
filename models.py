@@ -543,3 +543,135 @@ class BetterSimpleAgent(nn.Module):
         value = self.critic_out(critic_x)
 
         return action, probs.log_prob(action), probs.entropy(), value
+
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    if layer.bias is not None:
+        torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+class BetterPQNQNetwork(nn.Module):
+    """
+    PQN-style Q-network with:
+      - optional input BatchRenorm1d over the channel dimension
+      - GELU activations
+      - two-layer feedforward head
+      - Muon parameter splitting
+
+    Muon routing:
+      - default Muon params:
+          conv2.weight
+          conv3.weight
+          fc1.weight
+          fc2.weight
+      - optional:
+          conv1.weight   if use_muon_input=True
+          fc_out.weight  if use_muon_output=True
+
+      All norm params / biases remain on the Adam-side.
+    """
+
+    def __init__(
+        self,
+        env,
+        *,
+        use_muon_input: bool = False,
+        use_muon_output: bool = False,
+        brn_eps: float = 1e-5,
+        brn_momentum: float = 0.01,
+        brn_max_r: float = 3.0,
+        brn_max_d: float = 5.0,
+        brn_warmup_steps: int = 10000,
+        brn_smooth: bool = True,
+    ):
+        super().__init__()
+
+        self.use_muon_input = use_muon_input
+        self.use_muon_output = use_muon_output
+        action_dim = env.single_action_space.n
+
+        # Input normalization over channels for Atari stacked frames: [B, 4, H, W]
+        self.input_brn = BatchRenorm1d(
+            4,
+            eps=brn_eps,
+            momentum=brn_momentum,
+            max_r=brn_max_r,
+            max_d=brn_max_d,
+            warmup_steps=brn_warmup_steps,
+            smooth=brn_smooth,
+        )
+
+        self.conv1 = layer_init(nn.Conv2d(4, 32, 8, stride=4))
+        self.ln1 = nn.LayerNorm([32, 20, 20])
+
+        self.conv2 = layer_init(nn.Conv2d(32, 64, 4, stride=2))
+        self.ln2 = nn.LayerNorm([64, 9, 9])
+
+        self.conv3 = layer_init(nn.Conv2d(64, 64, 3, stride=1))
+        self.ln3 = nn.LayerNorm([64, 7, 7])
+
+        self.flatten = nn.Flatten()
+
+        self.fc1 = layer_init(nn.Linear(3136, 512))
+        self.ln4 = nn.LayerNorm(512)
+
+        self.fc2 = layer_init(nn.Linear(512, 512))
+        self.ln5 = nn.LayerNorm(512)
+
+        self.fc_out = layer_init(nn.Linear(512, action_dim))
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        x = x / 255.0
+        # x = self.input_brn(x)
+
+        x = self.conv1(x)
+        x = self.ln1(x)
+        x = self.act(x)
+
+        x = self.conv2(x)
+        x = self.ln2(x)
+        x = self.act(x)
+
+        x = self.conv3(x)
+        x = self.ln3(x)
+        x = self.act(x)
+
+        x = self.flatten(x)
+
+        x = self.fc1(x)
+        x = self.ln4(x)
+        x = self.act(x)
+
+        x = self.fc2(x)
+        x = self.ln5(x)
+        x = self.act(x)
+
+        x = self.fc_out(x)
+        return x
+
+    def get_split_params(self):
+        """
+        Returns:
+            muon_params, adam_params
+        """
+        muon_params = [
+            self.conv2.weight,
+            self.conv3.weight,
+            self.fc1.weight,
+            self.fc2.weight,
+        ]
+
+        if self.use_muon_input:
+            muon_params.append(self.conv1.weight)
+
+        if self.use_muon_output:
+            muon_params.append(self.fc_out.weight)
+
+        muon_ids = {id(p) for p in muon_params}
+        adam_params = [p for p in self.parameters() if id(p) not in muon_ids]
+
+        return muon_params, adam_params

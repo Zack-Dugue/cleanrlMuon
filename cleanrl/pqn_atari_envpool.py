@@ -15,6 +15,9 @@ import torch.optim as optim
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 
+from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD, SingleDeviceNorMuonWithAuxAdam
+from models import BetterPQNQNetwork
+
 
 @dataclass
 class Args:
@@ -34,6 +37,9 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+
+    # optional multi-gpu launcher compatibility
+    device: str = None
 
     # Algorithm specific arguments
     env_id: str = "Breakout-v5"
@@ -64,6 +70,14 @@ class Args:
     """the fraction of `total_timesteps` it takes from start_e to end_e"""
     q_lambda: float = 0.65
     """the lambda for the Q-Learning algorithm"""
+
+    # optimizer parity with your PPO script
+    optimizer: str = "Adam"  # ["SGD", "Adam", "Muon", "NorMuon", "AdaMuon", "BGD"]
+    momentum: float = 0.9
+
+    # model optimizer-routing kwargs
+    use_muon_input: bool = False
+    use_muon_output: bool = False
 
     # to be filled in runtime
     batch_size: int = 0
@@ -100,42 +114,14 @@ class RecordEpisodeStatistics(gym.Wrapper):
         self.episode_lengths *= 1 - infos["terminated"]
         infos["r"] = self.returned_episode_returns
         infos["l"] = self.returned_episode_lengths
+        if "lives" not in infos:
+            infos["lives"] = np.zeros(self.num_envs, dtype=np.int32)
         return (
             observations,
             rewards,
             dones,
             infos,
         )
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
-class QNetwork(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
-            nn.LayerNorm([32, 20, 20]),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-            nn.LayerNorm([64, 9, 9]),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-            nn.LayerNorm([64, 7, 7]),
-            nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(3136, 512)),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            layer_init(nn.Linear(512, env.single_action_space.n)),
-        )
-
-    def forward(self, x):
-        return self.network(x / 255.0)
 
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
@@ -149,6 +135,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+
     if args.track:
         import wandb
 
@@ -161,19 +148,23 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
+    # seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
     envs = envpool.make(
@@ -188,55 +179,135 @@ if __name__ == "__main__":
     envs.single_action_space = envs.action_space
     envs.single_observation_space = envs.observation_space
     envs = RecordEpisodeStatistics(envs)
+    print(f"envs.action_space type = {type(envs.action_space)}")
     assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    q_network = QNetwork(envs).to(device)
-    optimizer = optim.RAdam(q_network.parameters(), lr=args.learning_rate)
+    q_network = BetterPQNQNetwork(
+        envs,
+        use_muon_input=args.use_muon_input,
+        use_muon_output=args.use_muon_output,
+    ).to(device)
 
-    # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    MC_Method = False
+    device_type = device.type
+
+    if args.optimizer == "SGD":
+        optimizer = optim.SGD(
+            q_network.parameters(),
+            momentum=args.momentum,
+            lr=args.learning_rate,
+        )
+    elif args.optimizer == "Adam":
+        optimizer = optim.Adam(
+            q_network.parameters(),
+            betas=(args.momentum, 0.999),
+            lr=args.learning_rate,
+            eps=1e-5,
+        )
+    elif args.optimizer == "Muon":
+        muon_params, aux_params = q_network.get_split_params()
+        ns_steps = 2 if device_type == "cpu" else 5
+        param_groups = [
+            dict(
+                params=muon_params,
+                lr=args.learning_rate,
+                momentum=args.momentum,
+                weight_decay=1e-4,
+                use_muon=True,
+                ns_steps=ns_steps,
+            ),
+            dict(
+                params=aux_params,
+                lr=args.learning_rate / 300,
+                momentum=args.momentum,
+                weight_decay=1e-4,
+                use_muon=False,
+            ),
+        ]
+        optimizer = MuonWithAuxAdam(param_groups)
+    elif args.optimizer == "NorMuon":
+        muon_params, aux_params = q_network.get_split_params()
+        param_groups = [
+            dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
+            dict(params=aux_params, lr=args.learning_rate / 300, weight_decay=1e-4, use_muon=False),
+        ]
+        optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
+    elif args.optimizer == "AdaMuon":
+        muon_params, aux_params = q_network.get_split_params()
+        param_groups = [
+            dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
+            dict(params=aux_params, lr=args.learning_rate / 300, weight_decay=1e-4, use_muon=False),
+        ]
+        optimizer = AdaMuonWithAuxAdam(param_groups)
+    elif args.optimizer == "BGD":
+        params = BGD.create_unique_param_groups(q_network)
+        optimizer = BGD(
+            params,
+            std_init=0.01,
+            mean_eta=args.learning_rate,
+            std_eta=10,
+            betas=(args.momentum, 0.999, 0.99),
+            mc_iters=1,
+        )
+        MC_Method = True
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
+
+    # Storage
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device)
+    rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
+    dones = torch.zeros((args.num_steps, args.num_envs), device=device)
+    values = torch.zeros((args.num_steps, args.num_envs), device=device)
     avg_returns = deque(maxlen=20)
 
-    # TRY NOT TO MODIFY: start the game
+    # preserve per-parameter-group LR ratios during annealing
+    for g in optimizer.param_groups:
+        g["initial_lr"] = g["lr"]
+
+    # start
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset()).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    next_obs = torch.as_tensor(envs.reset(), device=device)
+    next_done = torch.zeros(args.num_envs, device=device, dtype=torch.float32)
 
     for iteration in range(1, args.num_iterations + 1):
-        # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            for g in optimizer.param_groups:
+                g["lr"] = frac * g["initial_lr"]
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
 
-            epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
+            epsilon = linear_schedule(
+                args.start_e,
+                args.end_e,
+                args.exploration_fraction * args.total_timesteps,
+                global_step,
+            )
 
-            random_actions = torch.randint(0, envs.single_action_space.n, (args.num_envs,)).to(device)
+            random_actions = torch.randint(0, envs.single_action_space.n, (args.num_envs,), device=device)
+
             with torch.no_grad():
+                if MC_Method:
+                    optimizer.randomize_weights(force_std=0)
                 q_values = q_network(next_obs)
                 max_actions = torch.argmax(q_values, dim=1)
-                values[step] = q_values[torch.arange(args.num_envs), max_actions].flatten()
+                values[step] = q_values[torch.arange(args.num_envs, device=device), max_actions].flatten()
 
-            explore = torch.rand((args.num_envs,)).to(device) < epsilon
+            explore = torch.rand((args.num_envs,), device=device) < epsilon
             action = torch.where(explore, random_actions, max_actions)
             actions[step] = action
 
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, next_done, info = envs.step(action.cpu().numpy())
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            next_obs_np, reward, next_done_np, info = envs.step(action.cpu().numpy())
+            rewards[step] = torch.as_tensor(reward, device=device).view(-1)
+            next_obs = torch.as_tensor(next_obs_np, device=device)
+            next_done = torch.as_tensor(next_done_np, device=device, dtype=torch.float32)
 
-            for idx, d in enumerate(next_done):
+            for idx, d in enumerate(next_done_np):
                 if d and info["lives"][idx] == 0:
                     print(f"global_step={global_step}, episodic_return={info['r'][idx]}")
                     avg_returns.append(info["r"][idx])
@@ -246,14 +317,16 @@ if __name__ == "__main__":
 
         # Compute Q(lambda) targets
         with torch.no_grad():
-            returns = torch.zeros_like(rewards).to(device)
+            returns = torch.zeros_like(rewards, device=device)
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
+                    if MC_Method:
+                        optimizer.randomize_weights(force_std=0)
                     next_value, _ = torch.max(q_network(next_obs), dim=-1)
-                    nextnonterminal = 1.0 - next_done
+                    nextnonterminal = 1.0 - next_done.float()
                     returns[t] = rewards[t] + args.gamma * next_value * nextnonterminal
                 else:
-                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextnonterminal = 1.0 - dones[t + 1].float()
                     next_value = values[t + 1]
                     returns[t] = (
                         rewards[t]
@@ -265,27 +338,32 @@ if __name__ == "__main__":
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_returns = returns.reshape(-1)
 
-        # Optimizing the Q-network
+        # optimize Q-network
         b_inds = np.arange(args.batch_size)
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
+                if MC_Method:
+                    optimizer.randomize_weights()
+
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
                 old_val = q_network(b_obs[mb_inds]).gather(1, b_actions[mb_inds].unsqueeze(-1).long()).squeeze()
                 loss = F.mse_loss(b_returns[mb_inds], old_val)
 
-                # optimize the model
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(q_network.parameters(), args.max_grad_norm)
+                if MC_Method:
+                    optimizer.aggregate_grads(1)
                 optimizer.step()
 
-        writer.add_scalar("losses/td_loss", loss, global_step)
+        writer.add_scalar("losses/td_loss", loss.item(), global_step)
         writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        sps = int(global_step / (time.time() - start_time))
+        print("SPS:", sps)
+        writer.add_scalar("charts/SPS", sps, global_step)
 
     envs.close()
     writer.close()
