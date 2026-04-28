@@ -147,13 +147,16 @@ class Agent(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
             layer_init(nn.Linear(64 * 7 * 7, 256)),
+            nn.LayerNorm(256),
             nn.ReLU(),
             layer_init(nn.Linear(256, 448)),
+            nn.LayerNorm(256),
             nn.ReLU(),
         )
         self.extra_layer = nn.Sequential(layer_init(nn.Linear(448, 448), std=0.1), nn.ReLU())
         self.actor = nn.Sequential(
             layer_init(nn.Linear(448, 448), std=0.01),
+            nn.LayerNorm(256),
             nn.ReLU(),
             layer_init(nn.Linear(448, envs.single_action_space.n), std=0.01),
         )
