@@ -93,7 +93,7 @@ class Agent(nn.Module):
             nn.LayerNorm(256),
             nn.ReLU(),
             layer_init(nn.Linear(256, 448)),
-            nn.LayerNorm(256),
+            nn.LayerNorm(448),
             nn.ReLU(),
         )
         self.extra_layer = nn.Sequential(layer_init(nn.Linear(448, 448), std=0.1), nn.ReLU())
