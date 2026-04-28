@@ -29,7 +29,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
@@ -59,7 +59,7 @@ class Args:
     num_minibatches: int = 1
     """the number of mini-batches"""
     update_epochs: int = 4
-    """the K epochs to update the policy"""
+    """the K epochs to update the Q-network"""
     max_grad_norm: float = 10.0
     """the maximum norm for the gradient clipping"""
     start_e: float = 1
@@ -145,7 +145,6 @@ if __name__ == "__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
-            monitor_gym=True,
             save_code=True,
         )
 

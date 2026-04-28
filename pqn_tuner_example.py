@@ -1,12 +1,3 @@
-"""
-atari10_tune_envpool.py
-- Tunes a CleanRL Atari agent implemented with EnvPool across a 10-game subset.
-- Uses MultiGPUTuner (your fail-fast, spawn-safe tuner).
-- Passes a fixed --optimizer STRING down to the training script (not tuned).
-- Normalizes episodic returns with rough per-game ranges (adjust as you like).
-- Saves the best trial to text/JSON files under <logs_root>/<study_name>/.
-"""
-
 from __future__ import annotations
 import argparse
 import json
@@ -31,7 +22,6 @@ ATARI10: List[str] = [
 ]
 
 # Rough normalization windows (min, max) for episodic return.
-# These are pragmatic defaults to stabilize cross-game aggregation; feel free to refine.
 TARGET_SCORES: Dict[str, Optional[List[float]]] = {
     "Pong-v5":              [-21.0, 21.0],
     "Breakout-v5":          [0.0, 400.0],
@@ -44,18 +34,25 @@ TARGET_SCORES: Dict[str, Optional[List[float]]] = {
 }
 
 
-def default_params_fn(optimizer_name: str):
+def default_params_fn(
+    optimizer_name: str,
+    *,
+    track: bool,
+    wandb_project_name: str,
+    wandb_entity: Optional[str],
+):
     """
-    Closure that captures the fixed optimizer string and returns an Optuna params_fn.
-    The tuner will inject --env-id and --seed for each run.
+    Closure that captures the fixed optimizer string and W&B settings and returns
+    an Optuna params_fn. The tuner will inject --env-id and --seed for each run.
     """
+
     def _fn(trial: optuna.Trial) -> dict:
         if optimizer_name in ["Muon", "NorMuon", "AdaMuon"]:
             learning_rate = trial.suggest_float("lr", 3e-4, 3e-2, log=True)
         else:
             learning_rate = trial.suggest_float("lr", 3e-5, 3e-3, log=True)
 
-        return {
+        params = {
             # Tunables
             "learning-rate": learning_rate,
             "momentum": trial.suggest_float("momentum", 0.9, 0.99),
@@ -69,7 +66,15 @@ def default_params_fn(optimizer_name: str):
 
             # Fixed (not tuned)
             "optimizer": optimizer_name,
+
+            # W&B settings for the spawned training runs
+            "track": track,
+            "wandb-project-name": wandb_project_name,
         }
+        if wandb_entity is not None:
+            params["wandb-entity"] = wandb_entity
+        return params
+
     return _fn
 
 
@@ -116,7 +121,7 @@ def save_best_trial(best, study_name: str, logs_root: str, optimizer_name: str, 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--script", type=str, default="cleanrl/pqn_atari_envpool.py",
+    p.add_argument("--script", type=str, default="cleanrl/pqn_atari_envpool_wandb.py",
                    help="Path to the EnvPool-based CleanRL script.")
     p.add_argument("--metric", type=str, default="charts/episodic_return",
                    help="TensorBoard scalar to read.")
@@ -134,16 +139,34 @@ def main():
                    help="Average last N scalars from TB for the metric.")
     p.add_argument("--wandb-tag", type=str, default=None,
                    help="Optional WandB tag for grouping/filtering runs.")
+    p.add_argument("--track", action="store_true",
+                   help="Enable Weights & Biases inside each spawned training run.")
+    p.add_argument("--wandb-project-name", type=str, default="cleanRL",
+                   help="W&B project name for both the tuner study run and the spawned training runs.")
+    p.add_argument("--wandb-entity", type=str, default=None,
+                   help="Optional W&B entity/team.")
     args = p.parse_args()
 
     gpu_list = [int(x) for x in args.gpus.split(",") if x.strip()]
+
+    study_wandb_kwargs = {}
+    if args.track:
+        study_wandb_kwargs = {
+            "project": args.wandb_project_name,
+            "entity": args.wandb_entity,
+        }
 
     tuner = MultiGPUTuner(
         script=args.script,
         metric=args.metric,
         gpus=gpu_list,
         target_scores={gid: TARGET_SCORES[gid] for gid in ATARI10},
-        params_fn=default_params_fn(args.optimizer),
+        params_fn=default_params_fn(
+            args.optimizer,
+            track=args.track,
+            wandb_project_name=args.wandb_project_name,
+            wandb_entity=args.wandb_entity,
+        ),
         direction="maximize",
         aggregation_type="average",
         metric_last_n_average_window=args.metric_window,
@@ -151,7 +174,7 @@ def main():
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
         storage=args.storage,
         study_name=args.study_name,
-        wandb_kwargs={},  # fill to enable Weights & Biases
+        wandb_kwargs=study_wandb_kwargs,
         logs_root=args.logs_root,
         wandb_tag=args.wandb_tag,
     )
