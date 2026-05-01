@@ -17,7 +17,7 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 # your modules
-from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD, SingleDeviceNorMuonWithAuxAdam
+from optimizers import *
 from models import Agent, SimpleAgent, BetterSimpleAgent  # <- uses your Agent class
 
 # ------------------ small wrapper to mimic CleanRL stats ------------------
@@ -134,7 +134,7 @@ class Args:
     seed: int = 1
     torch_deterministic: bool = True
     cuda: bool = True
-    track: bool = True
+    track: bool = False
     wandb_project_name: str = "cleanRL"
     wandb_entity: str = None
     capture_video: bool = False  # EnvPool path doesn’t record videos by default
@@ -251,6 +251,17 @@ if __name__ == "__main__":
                  weight_decay=1e-4, use_muon=False),
         ]
         optimizer = MuonWithAuxAdam(param_groups)
+
+    elif args.optimizer == "RLMuon":
+        muon_params, aux_params = agent.get_split_params()
+        ns_steps = 2 if device_type == "cpu" else 5
+        param_groups = [
+            dict(params=muon_params, lr=args.learning_rate, momentum=args.momentum, var_momentum=args.momentum**.09,
+                 weight_decay=1e-4, use_muon=True, nesterov=False, ns_steps=ns_steps),
+            dict(params=aux_params, lr=args.learning_rate/300, betas=(args.momentum,args.momentum**.5),
+                 weight_decay=1e-4, use_muon=False),
+        ]
+        optimizer = RLMuonWithAuxAdam(param_groups)
     elif args.optimizer == "NorMuon":
         muon_params, aux_params = agent.get_split_params()
         param_groups = [
