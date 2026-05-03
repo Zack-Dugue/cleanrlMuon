@@ -239,6 +239,7 @@ class MultiGPUTuner:
             start_trial = time.time()
             params = self.params_fn(trial)
             algo_argv = [f"--{k}={v}" for k, v in params.items()]
+            algo_argv.append("--track")
             MAIN_LOGGER.info(f"[TRIAL {trial.number}] Params: {params}")
 
             run = None
