@@ -209,7 +209,7 @@ if __name__ == "__main__":
         muon_params, aux_params = agent.get_split_params()
         ns_steps = 2 if device_type == "cpu" else 5
         param_groups = [
-            dict(params=muon_params, lr=args.learning_rate, momentum=args.momentum, var_momentum=args.momentum**.15,
+            dict(params=muon_params, lr=args.learning_rate, momentum=args.momentum, var_momentum=args.momentum**.25,
                  weight_decay=1e-4, use_muon=True, nesterov=True, ns_steps=ns_steps),
             dict(params=aux_params, lr=args.learning_rate/300,
                  weight_decay=1e-4, use_muon=False),
