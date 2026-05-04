@@ -466,12 +466,29 @@ class AdaMuonWithAuxAdam(torch.optim.Optimizer):
 class RLMuonWithAuxAdam(torch.optim.Optimizer):
     """
     Mixed optimizer:
-      - Normalized Muon path for use_muon=True (EMA via lerp, optional Nesterov, zeropower on raw g)
+      - Corrected normalized Muon path for use_muon=True
       - AdamW-style path for use_muon=False
+
+    External API is compatible with the original RLMuonWithAuxAdam:
+      RLMuonWithAuxAdam(param_groups, rank=None, world_size=None)
+
+    Expected param group fields:
+      For Muon groups:
+        params, use_muon=True, lr, weight_decay, momentum,
+        var_momentum, nesterov, ns_steps, eps
+
+      For aux Adam groups:
+        params, use_muon=False, lr, betas, eps, weight_decay
+
+    Corrections included:
+      - variance buffer initialized at zero, not one
+      - bias correction for momentum EMA
+      - bias correction for variance EMA
+      - corrected normalized scaling in single-GPU path
+      - per-size grouped update buffers retained for distributed compatibility
     """
 
     def __init__(self, param_groups, *, rank: int | None = None, world_size: int | None = None):
-        # ---- Change 1: auto-detect distributed, default to single-GPU ----
         if dist.is_available() and dist.is_initialized():
             self.rank = dist.get_rank() if rank is None else int(rank)
             self.world_size = dist.get_world_size() if world_size is None else int(world_size)
@@ -482,8 +499,10 @@ class RLMuonWithAuxAdam(torch.optim.Optimizer):
             self._dist_ready = False
 
         expanded = []
+
         for g in param_groups:
             assert "use_muon" in g, "Each param_group must include use_muon=True/False"
+
             params = list(g["params"])
             if not params:
                 continue
@@ -495,34 +514,61 @@ class RLMuonWithAuxAdam(torch.optim.Optimizer):
                 var_momentum = g.get("var_momentum", 0.999)
                 nesterov = g.get("nesterov", True)
                 ns_steps = g.get("ns_steps", 5)
-                eps      = g.get("eps",1e-10)
+                eps = g.get("eps", 1e-10)
 
-
-
+                # Keep original behavior: split Muon params by numel so distributed
+                # all_gather buffers have consistent sizes.
                 unique_sizes = {p.numel() for p in params}
+
                 for size in unique_sizes:
                     p_list = [p for p in params if p.numel() == size]
                     device = p_list[0].device
                     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-                    buf = torch.empty(self.world_size, size, dtype=dtype, device=device)
+
+                    update_buffer = torch.empty(
+                        self.world_size,
+                        size,
+                        dtype=dtype,
+                        device=device,
+                    )
+
+                    # Extra tiny distributed buffer for one scalar scale per rank.
+                    # This does not affect the external API.
+                    scale_buffer = torch.empty(
+                        self.world_size,
+                        dtype=torch.float32,
+                        device=device,
+                    )
 
                     expanded.append(dict(
                         params=p_list,
                         use_muon=True,
-                        lr=lr, weight_decay=weight_decay,
-                        momentum=momentum, var_momentum = var_momentum, nesterov=nesterov,
-                        ns_steps=ns_steps, update_buffer=buf, eps=eps,
-                        update_buffer_views=[buf[i] for i in range(self.world_size)],
+                        lr=lr,
+                        weight_decay=weight_decay,
+                        momentum=momentum,
+                        var_momentum=var_momentum,
+                        nesterov=nesterov,
+                        ns_steps=ns_steps,
+                        eps=eps,
+                        update_buffer=update_buffer,
+                        update_buffer_views=[update_buffer[i] for i in range(self.world_size)],
+                        scale_buffer=scale_buffer,
+                        scale_buffer_views=[scale_buffer[i] for i in range(self.world_size)],
                     ))
+
             else:
                 lr = g.get("lr", 3e-4)
                 betas = g.get("betas", (0.9, 0.95))
                 eps = g.get("eps", 1e-10)
                 weight_decay = g.get("weight_decay", 0.0)
+
                 expanded.append(dict(
                     params=params,
                     use_muon=False,
-                    lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=weight_decay,
                 ))
 
         super().__init__(expanded, {})
@@ -530,14 +576,17 @@ class RLMuonWithAuxAdam(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
+
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
         for group in self.param_groups:
             if group["use_muon"]:
                 self._step_muon_group(group)
             else:
                 self._step_aux_adam_group(group)
+
         return loss
 
     @torch.no_grad()
@@ -556,120 +605,196 @@ class RLMuonWithAuxAdam(torch.optim.Optimizer):
                 p.mul_(1 - lr * wd)
 
             st = self.state[p]
+
             if len(st) == 0:
                 st["exp_avg"] = torch.zeros_like(p)
                 st["exp_avg_sq"] = torch.zeros_like(p)
                 st["step"] = 0
+
             st["step"] += 1
             t = st["step"]
 
-            m = st["exp_avg"]; v = st["exp_avg_sq"]
+            m = st["exp_avg"]
+            v = st["exp_avg_sq"]
+
             m.mul_(beta1).add_(g, alpha=1 - beta1)
             v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
 
-            bc1 = 1 - beta1**t
-            bc2 = 1 - beta2**t
+            bc1 = 1 - beta1 ** t
+            bc2 = 1 - beta2 ** t
+
             step_dir = (m / bc1) / (v.sqrt() / (bc2 ** 0.5) + eps)
             p.add_(step_dir, alpha=-lr)
 
     @torch.no_grad()
-    def _step_muon_group(self, group: dict):
+    def _compute_muon_update_and_norm_scale(self, p: Tensor, group: dict):
         """
-        Normalized Muon path (your variant):
-          EMA via lerp, optional Nesterov, zeropower on raw g (not sign),
-          decoupled WD, per-size fused gather only if distributed.
-          Update scaling: -lr * 0.2 * sqrt(max(dim_last2))
+        Returns:
+          z_flat: flattened zeropower update
+          norm_scale: scalar corrected normalization factor
+
+        This function implements the corrected RLMuon logic from your first file,
+        while keeping the original optimizer's surrounding API.
         """
-        lr = group["lr"]; wd = group["weight_decay"]
-        momentum = group["momentum"]; nesterov = group["nesterov"]
+        g = p.grad
+        if g is None:
+            return None, None
+
+        if p.ndim < 2:
+            raise ValueError(
+                f"RLMuon got a parameter with shape {tuple(p.shape)}. "
+                "Route 1D params, biases, and norms to AdamW instead."
+            )
+
+        momentum = group["momentum"]
         var_momentum = group["var_momentum"]
+        nesterov = group["nesterov"]
         ns_steps = group["ns_steps"]
+        eps = group["eps"]
+
+        st = self.state[p]
+
+        if "momentum_buffer" not in st:
+            st["momentum_buffer"] = torch.zeros_like(g)
+
+        if "var_momentum_buffer" not in st:
+            # Corrected behavior: start variance EMA at zero, not one.
+            st["var_momentum_buffer"] = torch.zeros((), device=g.device, dtype=g.dtype)
+
+        if "step" not in st:
+            st["step"] = 0
+
+        st["step"] += 1
+        t = st["step"]
+
+        buf: Tensor = st["momentum_buffer"]
+        var_buf: Tensor = st["var_momentum_buffer"]
+
+        # EMA updates.
+        buf.lerp_(g, 1 - momentum)
+        var_buf.lerp_(g.pow(2).mean(), 1 - var_momentum)
+
+        # Bias corrections.
+        momentum_bc = 1 - momentum ** t
+        var_momentum_bc = 1 - var_momentum ** t
+
+        buf_corrected = buf / momentum_bc
+        var_buf_corrected = var_buf / var_momentum_bc
+
+        # Keep your original Nesterov-style effective gradient.
+        # Note: this uses the uncorrected buffer to preserve your previous semantics.
+        g_eff = g.lerp(buf, momentum) if nesterov else buf
+
+        original_shape = g_eff.shape
+
+        if g_eff.ndim >= 3:
+            g_eff_2d = g_eff.view(g_eff.size(0), -1)
+        else:
+            g_eff_2d = g_eff
+
+        z = zeropower_via_newtonschulz5(g_eff_2d, steps=ns_steps)
+        z = z.view(original_shape)
+
+        norm_scale = buf_corrected.abs().mean() / (var_buf_corrected + eps).sqrt()
+
+        return z.flatten(), norm_scale
+
+    @torch.no_grad()
+    def _step_muon_group(self, group: dict):
+        lr = group["lr"]
+        wd = group["weight_decay"]
         params = group["params"]
 
-        # ---- Change 2: single-process fast path ----
+        # Single-process path: fast and exact corrected behavior.
         if (not self._dist_ready) or self.world_size == 1:
             for p in params:
-                g = p.grad
-                if g is None:
+                if p.grad is None:
                     continue
 
-                st = self.state[p]
-                if "momentum_buffer" not in st:
-                    st["momentum_buffer"] = torch.zeros_like(g)
-
-                if "var_momentum_buffer" not in st:
-                    st["var_momentum_buffer"] = torch.ones((), device=g.device, dtype=g.dtype)
-                buf: Tensor = st["momentum_buffer"]
-                var_buf: Tensor = st["var_momentum_buffer"]
-
-                eps = group["eps"]
-                # EMA via lerp
-                buf.lerp_(g, 1 - momentum)
-                var_buf.lerp_(g.pow(2).mean(), 1 - var_momentum)
-                g_eff = g.lerp(buf, momentum) if nesterov else buf
-
-                if g_eff.ndim == 4:
-                    g_eff = g_eff.view(len(g_eff), -1)
-                z = zeropower_via_newtonschulz5(g_eff, steps=ns_steps).flatten()
+                z_flat, norm_scale = self._compute_muon_update_and_norm_scale(p, group)
+                if z_flat is None:
+                    continue
 
                 if wd != 0:
                     p.mul_(1 - lr * wd)
 
-                if p.ndim >= 2:
-                    scale = (-lr) * 0.2 * (max(p.size(-2), p.size(-1)) ** 0.5)* (buf.abs().mean()/(var_buf+ eps).sqrt())
-                else:
-                    scale = -lr * 0.2
+                dim_scale = 0.2 * (max(p.size(-2), p.size(-1)) ** 0.5)
+                scale = -lr * dim_scale * norm_scale
 
-                p.add_(z.view_as(p), alpha=scale)
+                p.add_(z_flat.view_as(p), alpha=scale)
+
             return
 
-        # ---- Distributed path (unchanged semantics) ----
+        # Distributed path:
+        # Retains original per-size all_gather structure, but also gathers the
+        # corrected scalar norm_scale for each rank's parameter.
         update_buffer: Tensor = group["update_buffer"]
         update_buffer_views = group["update_buffer_views"]
-        handle = None
+
+        scale_buffer: Tensor = group["scale_buffer"]
+        scale_buffer_views = group["scale_buffer_views"]
+
+        update_handle = None
+        scale_handle = None
         params_world = None
 
         def apply_prev():
-            handle.wait()
-            for p_world, g_world in zip(params_world, update_buffer_views):
+            update_handle.wait()
+            scale_handle.wait()
+
+            for p_world, z_world, scale_world in zip(
+                params_world,
+                update_buffer_views,
+                scale_buffer_views,
+            ):
                 if wd != 0:
                     p_world.mul_(1 - lr * wd)
-                if p_world.ndim >= 2:
-                    scale = (-lr) * 0.2 * (max(p_world.size(-2), p_world.size(-1)) ** 0.5)
-                else:
-                    scale = -lr * 0.2
-                p_world.add_(g_world.view_as(p_world), alpha=scale)
+
+                dim_scale = 0.2 * (max(p_world.size(-2), p_world.size(-1)) ** 0.5)
+                scale = -lr * dim_scale * scale_world.to(
+                    device=p_world.device,
+                    dtype=p_world.dtype,
+                )
+
+                p_world.add_(z_world.view_as(p_world).to(dtype=p_world.dtype), alpha=scale)
 
         for base_i in range(0, len(params), self.world_size):
             if base_i + self.rank < len(params):
                 p = params[base_i + self.rank]
-                g = p.grad
-                assert g is not None, "Gradient is None for a Muon param; ensure backward() ran."
 
-                st = self.state[p]
-                if "momentum_buffer" not in st:
-                    st["momentum_buffer"] = torch.zeros_like(g)
-                buf: Tensor = st["momentum_buffer"]
+                if p.grad is None:
+                    raise RuntimeError(
+                        "Gradient is None for a Muon param; ensure backward() ran."
+                    )
 
-                buf.lerp_(g, 1 - momentum)
-                g_eff = g.lerp(buf, momentum) if nesterov else buf
+                z_flat, norm_scale = self._compute_muon_update_and_norm_scale(p, group)
 
-                if g_eff.ndim == 4:
-                    g_eff = g_eff.view(len(g_eff), -1)
-                z = zeropower_via_newtonschulz5(g_eff, steps=ns_steps).flatten()
-                z = z.to(update_buffer.dtype)
+                z_send = z_flat.to(update_buffer.dtype)
+                scale_send = norm_scale.detach().to(scale_buffer.dtype)
             else:
-                z = update_buffer_views[self.rank]
+                # Dummy values for ranks without a parameter in this chunk.
+                z_send = torch.zeros_like(update_buffer_views[self.rank])
+                scale_send = torch.ones((), device=scale_buffer.device, dtype=scale_buffer.dtype)
 
             if base_i > 0:
                 apply_prev()
-            handle = dist.all_gather_into_tensor(update_buffer, z, async_op=True)
+
+            update_handle = dist.all_gather_into_tensor(
+                update_buffer,
+                z_send,
+                async_op=True,
+            )
+
+            scale_handle = dist.all_gather_into_tensor(
+                scale_buffer,
+                scale_send.reshape(()),
+                async_op=True,
+            )
+
             params_world = params[base_i: base_i + self.world_size]
 
-        if handle is not None:
+        if update_handle is not None:
             apply_prev()
-
-
 
 
 
