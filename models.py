@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from torchrl.modules import BatchRenorm1d
+from torchrl.modules import BatchRenorm1d, BatchRenorm2d
 # -------- utils --------
 def layer_init(layer, std=math.sqrt(2), bias_const=0.0):
     nn.init.orthogonal_(layer.weight, gain=std)
@@ -334,27 +334,57 @@ class SimpleAgent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), value
 
 
-
-class BetterSimpleAgent(nn.Module):
+class ConvSimpleAgent(nn.Module):
     """
-    Simple MLP actor-critic.
+    PQN-style ConvNet actor-critic for Atari EnvPool observations,
+    with input BatchRenorm2d.
 
-    Normalization:
-      - Flattened raw input is normalized with TorchRL BatchRenorm1d.
-      - TorchRL BatchRenorm1d keeps affine parameters by default.
-      - Hidden LayerNorms use elementwise_affine=False.
+    Expected input:
+      x shape [batch, 4, 84, 84], uint8-ish pixels in [0, 255]
 
-    Muon routing rule by default:
-      - hidden -> hidden linear weights use Muon
-      - input -> hidden weights use Adam unless use_muon_input=True
-      - hidden -> output weights use Adam unless use_muon_output=True
-      - all biases / norm params always use Adam
+    Input normalization:
+      x.float() / 255.0
+      BatchRenorm2d(C)
+
+    For Atari frame stacks:
+      C = 4
+
+    So BatchRenorm2d tracks one running distribution per stacked-frame channel,
+    across batch and spatial dimensions. This is much more natural for convnets
+    than flattening the whole image and using BatchRenorm1d(obs_dim).
+
+    PQN-style encoder:
+      Conv2d -> LayerNorm -> ReLU
+      Conv2d -> LayerNorm -> ReLU
+      Conv2d -> LayerNorm -> ReLU
+      Flatten
+      Linear -> LayerNorm -> ReLU
+
+    PPO-style separate heads:
+      actor_out:  Linear(hidden_dim, action_dim), std=0.01
+      critic_out: Linear(hidden_dim, 1), std=1.0
+
+    Muon routing:
+      default:
+        Muon gets trunk_fc.weight
+
+      use_muon_input=True:
+        also sends conv1.weight, conv2.weight, conv3.weight to Muon
+
+      use_muon_output=True:
+        also sends actor_out.weight and critic_out.weight to Muon
+
+      Adam gets:
+        BatchRenorm params,
+        LayerNorm params,
+        all biases,
+        and anything not explicitly routed to Muon.
     """
 
     def __init__(
         self,
         envs,
-        hidden_dim=256,
+        hidden_dim=512,
         *,
         use_muon_input=False,
         use_muon_output=False,
@@ -370,17 +400,43 @@ class BetterSimpleAgent(nn.Module):
         self.use_muon_input = use_muon_input
         self.use_muon_output = use_muon_output
 
-        obs_dim = int(np.prod(envs.single_observation_space.shape))
+        obs_shape = envs.single_observation_space.shape
         action_dim = envs.single_action_space.n
 
-        # TorchRL BatchRenorm1d has affine parameters internally:
-        #   input_brn.weight
-        #   input_brn.bias
+        if len(obs_shape) != 3:
+            raise ValueError(
+                f"Expected Atari image observation shape [C,H,W], got {obs_shape}"
+            )
+
+        c, h, w = obs_shape
+
+        if c != 4:
+            print(
+                f"[BetterSimpleAgent/PQN-BRN2d warning] expected 4 stacked frames, got C={c}. "
+                "Continuing anyway."
+            )
+
+        if h != 84 or w != 84:
+            print(
+                f"[BetterSimpleAgent/PQN-BRN2d warning] expected 84x84 Atari obs, got H={h}, W={w}. "
+                "LayerNorm shapes assume standard Atari preprocessing."
+            )
+
+        if hidden_dim != 512:
+            print(
+                f"[BetterSimpleAgent/PQN-BRN2d warning] PQN usually uses hidden_dim=512. "
+                f"You passed hidden_dim={hidden_dim}."
+            )
+
+        # Input BatchRenorm over image channels.
         #
-        # It expects the feature dimension to be dim=1.
-        # For flattened observations, x has shape [batch, obs_dim].
-        self.input_brn = BatchRenorm1d(
-            obs_dim,
+        # For x shape [B, C, H, W], BatchRenorm2d(C) normalizes each channel
+        # using statistics computed over B,H,W.
+        #
+        # For Atari stacked grayscale frames, C=4, so each frame index gets its
+        # own running statistics.
+        self.input_brn = BatchRenorm2d(
+            c,
             eps=brn_eps,
             momentum=brn_momentum,
             max_r=brn_max_r,
@@ -389,120 +445,127 @@ class BetterSimpleAgent(nn.Module):
             smooth=brn_smooth,
         )
 
-        # ----- critic -----
-        self.critic_in = layer_init(nn.Linear(obs_dim, hidden_dim))
-        self.critic_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=True)
+        # ----- PQN-style conv encoder -----
+        self.conv1 = layer_init(nn.Conv2d(c, 32, kernel_size=8, stride=4))
+        self.ln1 = nn.LayerNorm([32, 20, 20])
 
-        self.critic_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
-        self.critic_ln2 = nn.LayerNorm(hidden_dim, elementwise_affine=True)
+        self.conv2 = layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2))
+        self.ln2 = nn.LayerNorm([64, 9, 9])
 
-        self.critic_out = layer_init(nn.Linear(hidden_dim, 1), std=1.0)
+        self.conv3 = layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1))
+        self.ln3 = nn.LayerNorm([64, 7, 7])
 
-        # ----- actor -----
-        self.actor_in = layer_init(nn.Linear(obs_dim, hidden_dim))
-        self.actor_ln1 = nn.LayerNorm(hidden_dim, elementwise_affine=True)
+        self.flatten = nn.Flatten()
 
-        self.actor_mid = layer_init(nn.Linear(hidden_dim, hidden_dim))
-        self.actor_ln2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        # For 84x84 Atari:
+        # 84 -> conv1 -> 20
+        # 20 -> conv2 -> 9
+        # 9  -> conv3 -> 7
+        # so final conv output is 64 * 7 * 7 = 3136.
+        self.trunk_fc = layer_init(nn.Linear(64 * 7 * 7, hidden_dim))
+        self.trunk_ln = nn.LayerNorm(hidden_dim)
 
-        self.actor_out = layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
+        self.act = nn.ReLU()
 
-        self.act = nn.GELU()
+        # ----- Separate PPO actor/value heads -----
+        self.actor_out = layer_init(
+            nn.Linear(hidden_dim, action_dim),
+            std=0.01,
+        )
+        self.critic_out = layer_init(
+            nn.Linear(hidden_dim, 1),
+            std=1.0,
+        )
 
         total_params = sum(p.numel() for p in self.parameters())
-        print(f"[SimpleAgent] obs_dim={obs_dim:,}, hidden_dim={hidden_dim}, action_dim={action_dim}")
-        print(f"[SimpleAgent] total parameters: {total_params:,}")
-        print(f"[SimpleAgent] use_muon_input={use_muon_input}, use_muon_output={use_muon_output}")
+        muon_params, adam_params = self.get_split_params()
 
-    def _flatten_obs(self, x):
-        x = x.float()
-
-        if x.ndim > 2:
-            x = x.view(x.shape[0], -1)
-            x = x / 255.0
-
-        return x
+        print(
+            f"[BetterSimpleAgent/PQN-BRN2d] obs_shape={obs_shape}, "
+            f"hidden_dim={hidden_dim}, action_dim={action_dim}"
+        )
+        print("[BetterSimpleAgent/PQN-BRN2d] input normalization: BatchRenorm2d(C)")
+        print(f"[BetterSimpleAgent/PQN-BRN2d] total parameters: {total_params:,}")
+        print(f"[BetterSimpleAgent/PQN-BRN2d] Muon parameters: {sum(p.numel() for p in muon_params):,}")
+        print(f"[BetterSimpleAgent/PQN-BRN2d] Adam parameters: {sum(p.numel() for p in adam_params):,}")
+        print(
+            f"[BetterSimpleAgent/PQN-BRN2d] "
+            f"use_muon_input={use_muon_input}, use_muon_output={use_muon_output}"
+        )
 
     def _normalize_input(self, x):
-        x = self._flatten_obs(x)
+        """
+        Normalize raw Atari image input.
+
+        Input:
+          x: [B, C, H, W], usually uint8 in [0, 255]
+
+        Output:
+          x: [B, C, H, W], float normalized by /255 and BatchRenorm2d.
+        """
+        x = x.float() / 255.0
         x = self.input_brn(x)
         return x
 
-    def _critic_features_from_normalized(self, x):
-        """
-        x should already be flattened + BatchRenorm-normalized.
-        This avoids updating BatchRenorm stats more than once per shared forward.
-        """
-        x = self.critic_in(x)
-        x = self.critic_ln1(x)
+    def _features(self, x):
+        x = self._normalize_input(x)
+
+        x = self.conv1(x)
+        x = self.ln1(x)
         x = self.act(x)
 
-
-        x = self.critic_mid(x)
-        x = self.critic_ln2(x)
+        x = self.conv2(x)
+        x = self.ln2(x)
         x = self.act(x)
 
+        x = self.conv3(x)
+        x = self.ln3(x)
+        x = self.act(x)
+
+        x = self.flatten(x)
+
+        x = self.trunk_fc(x)
+        x = self.trunk_ln(x)
+        x = self.act(x)
 
         return x
-
-    def _actor_features_from_normalized(self, x):
-        """
-        x should already be flattened + BatchRenorm-normalized.
-        This avoids updating BatchRenorm stats more than once per shared forward.
-        """
-        x = self.actor_in(x)
-        x = self.actor_ln1(x)
-        x = self.act(x)
-
-
-        x = self.act(x)
-        x = self.actor_ln2(x)
-        x = self.actor_mid(x)
-
-        return x
-
-    def _critic_features(self, x):
-        """
-        Convenience path for value-only calls.
-        This updates BatchRenorm once.
-        """
-        x = self._normalize_input(x)
-        return self._critic_features_from_normalized(x)
-
-    def _actor_features(self, x):
-        """
-        Convenience path for actor-only calls.
-        This updates BatchRenorm once.
-        """
-        x = self._normalize_input(x)
-        return self._actor_features_from_normalized(x)
 
     def get_split_params(self):
         """
         Returns:
             muon_params, adam_params
 
-        By default, only hidden -> hidden matrix weights go to Muon.
+        Default:
+          Muon:
+            trunk_fc.weight
+
+          Adam:
+            input_brn params
+            conv weights unless use_muon_input=True
+            output heads unless use_muon_output=True
+            all biases
+            all LayerNorm params
 
         Optional:
-            use_muon_input=True
-                sends actor_in.weight and critic_in.weight to Muon.
+          use_muon_input=True:
+            conv1.weight
+            conv2.weight
+            conv3.weight
 
-            use_muon_output=True
-                sends actor_out.weight and critic_out.weight to Muon.
-
-        Biases, BatchRenorm params, and LayerNorm params always remain Adam-side.
+          use_muon_output=True:
+            actor_out.weight
+            critic_out.weight
         """
 
         muon_params = [
-            self.actor_mid.weight,
-            self.critic_mid.weight,
+            self.trunk_fc.weight,
         ]
 
         if self.use_muon_input:
             muon_params.extend([
-                self.actor_in.weight,
-                self.critic_in.weight,
+                self.conv1.weight,
+                self.conv2.weight,
+                self.conv3.weight,
             ])
 
         if self.use_muon_output:
@@ -521,29 +584,225 @@ class BetterSimpleAgent(nn.Module):
         return muon_params, adam_params
 
     def get_value(self, x):
-        # Normalizes input once.
-        critic_x = self._critic_features(x)
-        return self.critic_out(critic_x)
+        features = self._features(x)
+        return self.critic_out(features)
 
     def get_action_and_value(self, x, action=None):
-        # Important:
-        # BatchRenorm is applied once here and the same normalized input is reused
-        # by both actor and critic. This avoids updating running stats twice.
-        x = self._normalize_input(x)
+        features = self._features(x)
 
-        actor_x = self._actor_features_from_normalized(x)
-        logits = self.actor_out(actor_x)
-
+        logits = self.actor_out(features)
         probs = Categorical(logits=logits)
 
         if action is None:
             action = probs.sample()
 
-        critic_x = self._critic_features_from_normalized(x)
-        value = self.critic_out(critic_x)
+        value = self.critic_out(features)
 
         return action, probs.log_prob(action), probs.entropy(), value
 
+
+class BetterSimpleAgent(nn.Module):
+    """
+    PQN-style ConvNet actor-critic for Atari EnvPool observations.
+
+    Based on CleanRL/PQN Atari encoder:
+      Conv2d(4, 32, 8, stride=4)
+      LayerNorm([32, 20, 20])
+      ReLU
+      Conv2d(32, 64, 4, stride=2)
+      LayerNorm([64, 9, 9])
+      ReLU
+      Conv2d(64, 64, 3, stride=1)
+      LayerNorm([64, 7, 7])
+      ReLU
+      Flatten
+      Linear(3136, 512)
+      LayerNorm(512)
+      ReLU
+
+    PPO-style separate heads:
+      actor_out:  Linear(512, action_dim), std=0.01
+      critic_out: Linear(512, 1), std=1.0
+
+    Muon routing:
+      default:
+        Muon gets trunk_fc.weight
+
+      use_muon_input=True:
+        also sends conv1.weight, conv2.weight, conv3.weight to Muon
+
+      use_muon_output=True:
+        also sends actor_out.weight and critic_out.weight to Muon
+
+      Adam gets:
+        all biases
+        all LayerNorm weights/biases
+        anything not explicitly routed to Muon
+    """
+
+    def __init__(
+        self,
+        envs,
+        hidden_dim=512,
+        *,
+        use_muon_input=False,
+        use_muon_output=False,
+    ):
+        super().__init__()
+
+        self.use_muon_input = use_muon_input
+        self.use_muon_output = use_muon_output
+
+        obs_shape = envs.single_observation_space.shape
+        action_dim = envs.single_action_space.n
+
+        if len(obs_shape) != 3:
+            raise ValueError(f"Expected Atari image observation shape [C,H,W], got {obs_shape}")
+
+        c, h, w = obs_shape
+        if c != 4:
+            print(
+                f"[BetterSimpleAgent/PQN warning] expected 4 stacked frames, got C={c}. "
+                "Continuing anyway."
+            )
+
+        if hidden_dim != 512:
+            print(
+                f"[BetterSimpleAgent/PQN warning] PQN uses hidden_dim=512. "
+                f"You passed hidden_dim={hidden_dim}."
+            )
+
+        # ----- PQN encoder, copied structurally from CleanRL pqn_atari_envpool.py -----
+        self.conv1 = layer_init(nn.Conv2d(c, 32, kernel_size=8, stride=4))
+        self.ln1 = nn.LayerNorm([32, 20, 20])
+
+        self.conv2 = layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2))
+        self.ln2 = nn.LayerNorm([64, 9, 9])
+
+        self.conv3 = layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1))
+        self.ln3 = nn.LayerNorm([64, 7, 7])
+
+        self.flatten = nn.Flatten()
+
+        # CleanRL PQN uses Linear(3136, 512), because 64*7*7 = 3136.
+        self.trunk_fc = layer_init(nn.Linear(3136, hidden_dim))
+        self.trunk_ln = nn.LayerNorm(hidden_dim)
+
+        self.act = nn.ReLU()
+
+        # ----- separate PPO actor/value heads -----
+        self.actor_out = layer_init(
+            nn.Linear(hidden_dim, action_dim),
+            std=0.01,
+        )
+        self.critic_out = layer_init(
+            nn.Linear(hidden_dim, 1),
+            std=1.0,
+        )
+
+        total_params = sum(p.numel() for p in self.parameters())
+        muon_params, adam_params = self.get_split_params()
+
+        print(
+            f"[BetterSimpleAgent/PQN-ActorCritic] obs_shape={obs_shape}, "
+            f"hidden_dim={hidden_dim}, action_dim={action_dim}"
+        )
+        print(f"[BetterSimpleAgent/PQN-ActorCritic] total parameters: {total_params:,}")
+        print(f"[BetterSimpleAgent/PQN-ActorCritic] Muon parameters: {sum(p.numel() for p in muon_params):,}")
+        print(f"[BetterSimpleAgent/PQN-ActorCritic] Adam parameters: {sum(p.numel() for p in adam_params):,}")
+        print(f"[BetterSimpleAgent/PQN-ActorCritic] use_muon_input={use_muon_input}, use_muon_output={use_muon_output}")
+
+    def _features(self, x):
+        x = x.float() / 255.0
+
+        x = self.conv1(x)
+        x = self.ln1(x)
+        x = self.act(x)
+
+        x = self.conv2(x)
+        x = self.ln2(x)
+        x = self.act(x)
+
+        x = self.conv3(x)
+        x = self.ln3(x)
+        x = self.act(x)
+
+        x = self.flatten(x)
+
+        x = self.trunk_fc(x)
+        x = self.trunk_ln(x)
+        x = self.act(x)
+
+        return x
+
+    def get_split_params(self):
+        """
+        Returns:
+            muon_params, adam_params
+
+        Default:
+          Muon:
+            trunk_fc.weight
+
+          Adam:
+            conv weights unless use_muon_input=True
+            output heads unless use_muon_output=True
+            all biases
+            all LayerNorm params
+
+        Optional:
+          use_muon_input=True:
+            conv1.weight
+            conv2.weight
+            conv3.weight
+
+          use_muon_output=True:
+            actor_out.weight
+            critic_out.weight
+        """
+
+        muon_params = [
+            self.trunk_fc.weight,
+        ]
+
+        if self.use_muon_input:
+            muon_params.extend([
+                self.conv1.weight,
+                self.conv2.weight,
+                self.conv3.weight,
+            ])
+
+        if self.use_muon_output:
+            muon_params.extend([
+                self.actor_out.weight,
+                self.critic_out.weight,
+            ])
+
+        muon_ids = {id(p) for p in muon_params}
+
+        adam_params = [
+            p for p in self.parameters()
+            if id(p) not in muon_ids
+        ]
+
+        return muon_params, adam_params
+
+    def get_value(self, x):
+        features = self._features(x)
+        return self.critic_out(features)
+
+    def get_action_and_value(self, x, action=None):
+        features = self._features(x)
+
+        logits = self.actor_out(features)
+        probs = Categorical(logits=logits)
+
+        if action is None:
+            action = probs.sample()
+
+        value = self.critic_out(features)
+
+        return action, probs.log_prob(action), probs.entropy(), value
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
