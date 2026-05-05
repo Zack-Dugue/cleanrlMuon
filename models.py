@@ -465,9 +465,14 @@ class ConvSimpleAgent(nn.Module):
         self.trunk_fc = layer_init(nn.Linear(64 * 7 * 7, hidden_dim))
         self.trunk_ln = nn.LayerNorm(hidden_dim)
 
-        self.act = nn.ReLU()
+        self.act = nn.GELU()
 
         # ----- Separate PPO actor/value heads -----
+        self.actor_fc = layer_init(nn.Linear(hidden_dim, hidden_dim))
+        self.critic_fc = layer_init(nn.Linear(hidden_dim, 1))
+        self.actor_ln = nn.LayerNorm(hidden_dim)
+        self.critic_ln = nn.LayerNorm(hidden_dim)
+
         self.actor_out = layer_init(
             nn.Linear(hidden_dim, action_dim),
             std=0.01,
@@ -558,6 +563,8 @@ class ConvSimpleAgent(nn.Module):
         """
 
         muon_params = [
+            self.actor_fc.weight,
+            self.critic_fc.weight,
             self.trunk_fc.weight,
         ]
 
@@ -585,18 +592,18 @@ class ConvSimpleAgent(nn.Module):
 
     def get_value(self, x):
         features = self._features(x)
-        return self.critic_out(features)
+        return self.critic_out(self.act(self.critic_ln(self.critic_fc(features))))
 
     def get_action_and_value(self, x, action=None):
         features = self._features(x)
 
-        logits = self.actor_out(features)
+        logits = self.actor_out(self.act(self.actor_ln(self.actor_fc(features))))
         probs = Categorical(logits=logits)
 
         if action is None:
             action = probs.sample()
 
-        value = self.critic_out(features)
+        value = self.critic_out(self.act(self.critic_ln(self.critic_fc(features))))
 
         return action, probs.log_prob(action), probs.entropy(), value
 
