@@ -90,6 +90,7 @@ class Args:
     track: bool = False
     wandb_project_name: str = "cleanRL"
     wandb_entity: str = None
+    wandb_tag: str = None
     capture_video: bool = False  # EnvPool path doesn’t record videos by default
 
     #multi_gpu stuff:
@@ -148,6 +149,7 @@ if __name__ == "__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
+            tags=[args.wandb_tag] if args.wandb_tag else None,
             save_code=True,
         )
 
