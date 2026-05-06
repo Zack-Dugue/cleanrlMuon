@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # your modules
 from optimizers import *
-from models import Agent, SimpleAgent, BetterSimpleAgent, ConvSimpleAgent  # <- uses your Agent class
+from models import Agent, SimpleAgent, ConvSimpleAgent  # <- uses your Agent class
 
 # ------------------ small wrapper to mimic CleanRL stats ------------------
 class RecordEpisodeStatistics(gym.Wrapper):
