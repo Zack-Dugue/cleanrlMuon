@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from torchrl.modules import BatchRenorm1d, BatchRenorm2d
+from torchrl.modules import BatchRenorm1d
 # -------- utils --------
 def layer_init(layer, std=math.sqrt(2), bias_const=0.0):
     nn.init.orthogonal_(layer.weight, gain=std)
@@ -435,15 +435,15 @@ class ConvSimpleAgent(nn.Module):
         #
         # For Atari stacked grayscale frames, C=4, so each frame index gets its
         # own running statistics.
-        self.input_brn = BatchRenorm2d(
-            c,
-            eps=brn_eps,
-            momentum=brn_momentum,
-            max_r=brn_max_r,
-            max_d=brn_max_d,
-            warmup_steps=brn_warmup_steps,
-            smooth=brn_smooth,
-        )
+        # self.input_brn = BatchRenorm2d(
+        #     c,
+        #     eps=brn_eps,
+        #     momentum=brn_momentum,
+        #     max_r=brn_max_r,
+        #     max_d=brn_max_d,
+        #     warmup_steps=brn_warmup_steps,
+        #     smooth=brn_smooth,
+        # )
 
         # ----- PQN-style conv encoder -----
         self.conv1 = layer_init(nn.Conv2d(c, 32, kernel_size=8, stride=4))
@@ -509,7 +509,7 @@ class ConvSimpleAgent(nn.Module):
           x: [B, C, H, W], float normalized by /255 and BatchRenorm2d.
         """
         x = x.float() / 255.0
-        x = self.input_brn(x)
+        # x = self.input_brn(x)
         return x
 
     def _features(self, x):
