@@ -10,6 +10,12 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --account=aalaeddini_391_0001
+#
+# Email notifications.
+# Replace this with your real email.
+#SBATCH --mail-type=FAIL,END
+#SBATCH --mail-user=zdugue@smu.edu
+#
 # #SBATCH --mem=64G
 
 set -euo pipefail
@@ -21,33 +27,27 @@ set -euo pipefail
 SCRIPT="cleanrl/ppo_atari_envpool.py"
 EVAL_LAUNCHER="best_run_eval.py"
 
-# This is now the source of truth for the best hyperparameters.
-# It should be the summary .txt written by write_optuna_summary_file().
+# This is the source of truth for the best hyperparameters.
 BEST_SUMMARY_FILE="tuner_logs/atari10_envpool_RLMuon/optuna_summaries/atari10_envpool_RLMuon__RL_Muon_test.txt"
 
 # Optimizer to pass through to CleanRL.
-# This should match the optimizer used during the tuning run.
 OPTIMIZER="RLMuon"
 
 # Evaluation size.
 NUM_SEEDS=10
 SEED_START=1
 
-# Keep these the same as tuning unless you intentionally want a different eval budget.
-TOTAL_TIMESTEPS=5000000
+# Keep these the same as tuning unless intentionally changing eval budget.
+TOTAL_TIMESTEPS=10000000
 NUM_ENVS=32
 NUM_STEPS=256
 
 # 8 GPUs per node.
 GPUS="0,1,2,3,4,5,6,7"
-
-# With 8 concurrent runs on 128 CPUs, 16 CPU threads per run is natural.
 CPUS_PER_RUN=16
 
 # Separate W&B project from tuning.
 WANDB_PROJECT="cleanrl-atari-best-hparam-eval"
-
-# Keep this descriptive and unique.
 WANDB_TAG="${OPTIMIZER}_best_summary_eval"
 
 LOGS_ROOT="eval_logs/${WANDB_TAG}"
@@ -72,7 +72,7 @@ echo "LOGS_ROOT=${LOGS_ROOT}"
 
 module purge
 
-# Adjust these two lines to match however you normally activate this env.
+# Adjust if your cluster uses a different env activation setup.
 module load conda || true
 source ~/.bashrc
 conda activate RLMuon
@@ -101,8 +101,6 @@ export PYTHONUNBUFFERED=1
 export PYTHONIOENCODING=utf-8
 export TF_CPP_MIN_LOG_LEVEL=2
 
-# These are launcher-level defaults. The Python launcher also sets these
-# per subprocess.
 export OMP_NUM_THREADS="${CPUS_PER_RUN}"
 export MKL_NUM_THREADS="${CPUS_PER_RUN}"
 export OPENBLAS_NUM_THREADS="${CPUS_PER_RUN}"
@@ -140,6 +138,7 @@ python -u "${EVAL_LAUNCHER}" \
   --wandb-project-name "${WANDB_PROJECT}" \
   --wandb-tag "${WANDB_TAG}" \
   --logs-root "${LOGS_ROOT}" \
-  --cpus-per-run "${CPUS_PER_RUN}"
+  --cpus-per-run "${CPUS_PER_RUN}" \
+  --fail-fast
 
 echo "Job finished on $(date)"
