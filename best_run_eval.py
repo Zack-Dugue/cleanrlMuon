@@ -2,44 +2,35 @@
 """
 eval_best_hparams_from_summary_envpool.py
 
-Evaluate the best hyperparameters from an Optuna summary .txt file.
+Evaluate best hyperparameters from an Optuna summary .txt file.
+
+This version has aggressive logging because cluster/subprocess failures can be
+otherwise invisible when the job crashes instantly.
 
 Important:
-- This script does NOT read the Optuna SQLite database.
-- It parses the text summary written by write_optuna_summary_file().
-- This avoids contamination from older trials in a reused Optuna study DB.
-
-It launches fresh CleanRL training/evaluation runs across more Atari games and
-more seeds, using the parsed best hyperparameters.
-
-Example:
-  python eval_best_hparams_from_summary_envpool.py \
-    --script cleanrl/ppo_atari_envpool.py \
-    --best-summary-file tuner_logs/atari10_envpool_RLMuon/optuna_summaries/atari10_envpool_RLMuon__RL_Muon_test.txt \
-    --optimizer RLMuon \
-    --gpus 0,1,2,3,4,5,6,7 \
-    --num-seeds 10 \
-    --wandb-project-name cleanrl-atari-best-hparam-eval \
-    --wandb-tag RLMuon_best_eval
+- Does NOT read the Optuna SQLite DB.
+- Parses BEST HYPERPARAMETERS / OPTIMAL VARIABLES from the summary .txt file.
+- Launches CleanRL runs as subprocesses.
+- Assigns each GPU a sequential queue to avoid GPU oversubscription.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import os
 import re
 import shlex
 import subprocess
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-# Larger evaluation set than your tuning set.
-# These should work with EnvPool/Gymnasium Atari v5 if your environment has the ROMs.
 ATARI_EVAL_GAMES: List[str] = [
     "Alien-v5",
     "Amidar-v5",
@@ -73,8 +64,6 @@ ATARI_EVAL_GAMES: List[str] = [
     "VideoPinball-v5",
 ]
 
-
-# Original tuning set, useful for sanity checking.
 TUNING_GAMES: List[str] = [
     "Pong-v5",
     "Breakout-v5",
@@ -88,30 +77,49 @@ TUNING_GAMES: List[str] = [
 
 
 def safe_slug(x) -> str:
-    """
-    Make a string safe for filenames.
-    """
     if x is None:
         return "none"
-
     x = str(x).strip()
     if not x:
         return "none"
-
     x = re.sub(r"[^A-Za-z0-9_.=-]+", "_", x)
     return x[:140]
 
 
-def parse_scalar_value(x: str):
-    """
-    Parse a scalar value from the summary text file.
+def setup_logging(logs_root: str, wandb_tag: str) -> Path:
+    Path(logs_root).mkdir(parents=True, exist_ok=True)
 
-    Handles:
-      int:    5
-      float:  0.001
-      sci:    1e-4
-      string: fallback
-    """
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = Path(logs_root) / f"launcher__{safe_slug(wandb_tag)}__{timestamp}.log"
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(threadName)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(fmt)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(fmt)
+
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+
+    logging.info("=" * 100)
+    logging.info("launcher log path: %s", log_path)
+    logging.info("=" * 100)
+
+    return log_path
+
+
+def parse_scalar_value(x: str):
     x = x.strip()
 
     try:
@@ -127,57 +135,51 @@ def parse_scalar_value(x: str):
 
 
 def load_best_params_from_summary(summary_path: str) -> Dict[str, object]:
-    """
-    Parse the best hyperparameters from the summary file produced by
-    write_optuna_summary_file().
-
-    It reads exactly this section:
-
-      BEST HYPERPARAMETERS / OPTIMAL VARIABLES
-      ----------------------------------------------------------------------------------------------------
-      lr: ...
-      ent_coef: ...
-      update_epochs: ...
-      momentum: ...
-
-    and stops at the blank line after the section.
-    """
     path = Path(summary_path)
+    logging.info("checking best summary file: %s", path.resolve())
+
     if not path.exists():
         raise FileNotFoundError(f"Could not find best-summary-file: {path}")
 
-    lines = path.read_text(encoding="utf-8").splitlines()
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    logging.info("summary file exists")
+    logging.info("summary file size bytes: %s", path.stat().st_size)
+    logging.info("summary file lines: %s", len(lines))
 
     section_name = "BEST HYPERPARAMETERS / OPTIMAL VARIABLES"
     in_section = False
     params: Dict[str, object] = {}
 
-    for raw_line in lines:
+    for i, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
 
         if line == section_name:
+            logging.info("found best-param section at line %d", i)
             in_section = True
             continue
 
         if not in_section:
             continue
 
-        # Skip dashed separator.
         if line and set(line) == {"-"}:
             continue
 
-        # The summary writer puts a blank line after the best-param section.
         if line == "":
+            logging.info("end of best-param section at line %d", i)
             break
 
         if line == "(none)":
+            logging.info("best-param section says none")
             break
 
-        # Defensive stop in case the format changes.
         if line.isupper() and ":" not in line:
+            logging.info("stopping best-param parse at next section line %d: %s", i, line)
             break
 
         if ":" not in line:
+            logging.info("skipping non key/value line %d in best-param section: %s", i, line)
             continue
 
         key, value = line.split(":", 1)
@@ -185,7 +187,9 @@ def load_best_params_from_summary(summary_path: str) -> Dict[str, object]:
         value = value.strip()
 
         if key:
-            params[key] = parse_scalar_value(value)
+            parsed = parse_scalar_value(value)
+            params[key] = parsed
+            logging.info("parsed best param: %s = %r", key, parsed)
 
     required = ["lr", "ent_coef", "update_epochs", "momentum"]
     missing = [k for k in required if k not in params]
@@ -194,19 +198,14 @@ def load_best_params_from_summary(summary_path: str) -> Dict[str, object]:
         raise RuntimeError(
             f"Summary file did not contain required best params: {missing}\n"
             f"summary_path={path}\n"
-            f"parsed_params={params}"
+            f"parsed_params={params}\n"
+            f"Expected section header exactly: {section_name!r}"
         )
 
     return params
 
 
 def parse_run_config_from_summary(summary_path: str) -> Dict[str, str]:
-    """
-    Optional helper: parse RUN CONFIGURATION ARGS from the summary file.
-
-    This is only used for printing/sanity checking. The actual evaluated
-    hyperparameters come from BEST HYPERPARAMETERS / OPTIMAL VARIABLES.
-    """
     path = Path(summary_path)
     lines = path.read_text(encoding="utf-8").splitlines()
 
@@ -250,46 +249,25 @@ def best_params_to_cleanrl_flags(
     num_envs: int,
     num_steps: int,
 ) -> Dict[str, object]:
-    """
-    Convert parsed Optuna summary params into CleanRL CLI flags.
-
-    Summary names:
-      lr
-      ent_coef
-      update_epochs
-      momentum
-
-    CleanRL CLI flags:
-      --learning-rate
-      --ent-coef
-      --update-epochs
-      --momentum
-    """
-    return {
+    flags = {
         "learning-rate": float(best_params["lr"]),
         "ent-coef": float(best_params["ent_coef"]),
         "update-epochs": int(best_params["update_epochs"]),
         "momentum": float(best_params["momentum"]),
-
-        # Fixed eval settings.
         "num-envs": int(num_envs),
         "num-steps": int(num_steps),
         "total-timesteps": int(total_timesteps),
-
-        # Fixed optimizer choice.
         "optimizer": optimizer,
     }
 
+    logging.info("converted CleanRL flags:")
+    for k, v in flags.items():
+        logging.info("  --%s %s", k, v)
+
+    return flags
+
 
 def params_to_argv(params: Dict[str, object]) -> List[str]:
-    """
-    Convert a dict of CleanRL args into CLI flags.
-
-    Example:
-      {"learning-rate": 3e-4, "track": True}
-    becomes:
-      ["--learning-rate", "0.0003", "--track"]
-    """
     argv: List[str] = []
 
     for key, value in params.items():
@@ -323,12 +301,6 @@ def split_tasks_across_gpus(
     tasks: List[Tuple[str, int]],
     gpus: List[int],
 ) -> Dict[int, List[Tuple[str, int]]]:
-    """
-    Assign tasks round-robin to fixed GPU queues.
-
-    This avoids the subtle oversubscription bug where a GPU can receive a new
-    task while a previous task on that same GPU is still running.
-    """
     by_gpu: Dict[int, List[Tuple[str, int]]] = {gpu: [] for gpu in gpus}
 
     for idx, task in enumerate(tasks):
@@ -336,6 +308,17 @@ def split_tasks_across_gpus(
         by_gpu[gpu].append(task)
 
     return by_gpu
+
+
+def tail_file(path: Path, n: int = 80) -> str:
+    try:
+        if not path.exists():
+            return f"(log file does not exist: {path})"
+
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-n:])
+    except Exception:
+        return f"(failed to read tail of {path})\n{traceback.format_exc()}"
 
 
 def run_one_cleanrl_subprocess(
@@ -353,104 +336,157 @@ def run_one_cleanrl_subprocess(
     extra_args: List[str],
     dry_run: bool,
 ) -> Dict[str, object]:
-    """
-    Launch one CleanRL run as a subprocess on exactly one visible GPU.
-    """
-    Path(logs_root).mkdir(parents=True, exist_ok=True)
+    try:
+        Path(logs_root).mkdir(parents=True, exist_ok=True)
 
-    safe_env = safe_slug(env_id)
-    safe_tag = safe_slug(wandb_tag)
-    log_path = Path(logs_root) / f"{safe_env}__seed{seed}__gpu{gpu}__{safe_tag}.log"
+        safe_env = safe_slug(env_id)
+        safe_tag = safe_slug(wandb_tag)
+        log_path = Path(logs_root) / f"{safe_env}__seed{seed}__gpu{gpu}__{safe_tag}.log"
 
-    argv = [
-        sys.executable,
-        "-u",
-        script,
-        "--env-id",
-        env_id,
-        "--seed",
-        str(seed),
-        "--track",
-        "--wandb-project-name",
-        wandb_project_name,
-    ]
+        script_path = Path(script)
+        if not script_path.exists():
+            raise FileNotFoundError(f"CleanRL script does not exist: {script_path.resolve()}")
 
-    if wandb_entity:
-        argv.extend(["--wandb-entity", wandb_entity])
+        argv = [
+            sys.executable,
+            "-u",
+            script,
+            "--env-id",
+            env_id,
+            "--seed",
+            str(seed),
+            "--track",
+            "--wandb-project-name",
+            wandb_project_name,
+        ]
 
-    if wandb_tag:
-        argv.extend(["--wandb-tag", wandb_tag])
+        if wandb_entity:
+            argv.extend(["--wandb-entity", wandb_entity])
 
-    argv.extend(params_to_argv(cleanrl_params))
-    argv.extend(extra_args)
+        if wandb_tag:
+            argv.extend(["--wandb-tag", wandb_tag])
 
-    env = os.environ.copy()
+        argv.extend(params_to_argv(cleanrl_params))
+        argv.extend(extra_args)
 
-    # Each subprocess sees only one physical GPU.
-    # Inside the subprocess, cuda:0 maps to this physical GPU.
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env["OMP_NUM_THREADS"] = str(cpus_per_run)
+        env["MKL_NUM_THREADS"] = str(cpus_per_run)
+        env["OPENBLAS_NUM_THREADS"] = str(cpus_per_run)
+        env["NUMEXPR_NUM_THREADS"] = str(cpus_per_run)
+        env.setdefault("WANDB_START_METHOD", "thread")
+        env.setdefault("WANDB__SERVICE_WAIT", "300")
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
 
-    # Avoid CPU oversubscription.
-    env["OMP_NUM_THREADS"] = str(cpus_per_run)
-    env["MKL_NUM_THREADS"] = str(cpus_per_run)
-    env["OPENBLAS_NUM_THREADS"] = str(cpus_per_run)
-    env["NUMEXPR_NUM_THREADS"] = str(cpus_per_run)
+        cmd_str = " ".join(shlex.quote(x) for x in argv)
 
-    # Make W&B less fragile under subprocess-heavy jobs.
-    env.setdefault("WANDB_START_METHOD", "thread")
-    env.setdefault("WANDB__SERVICE_WAIT", "300")
+        logging.info("=" * 100)
+        logging.info("[launch] env=%s seed=%s physical_gpu=%s", env_id, seed, gpu)
+        logging.info("[launch] log=%s", log_path)
+        logging.info("[launch] cwd=%s", os.getcwd())
+        logging.info("[launch] python=%s", sys.executable)
+        logging.info("[launch] CUDA_VISIBLE_DEVICES for child=%s", env["CUDA_VISIBLE_DEVICES"])
+        logging.info("[launch] cmd=%s", cmd_str)
 
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
+        with log_path.open("w", encoding="utf-8") as f:
+            f.write("=" * 100 + "\n")
+            f.write("CLEANRL SUBPROCESS LAUNCH LOG\n")
+            f.write("=" * 100 + "\n")
+            f.write(f"env_id: {env_id}\n")
+            f.write(f"seed: {seed}\n")
+            f.write(f"physical_gpu: {gpu}\n")
+            f.write(f"cwd: {os.getcwd()}\n")
+            f.write(f"python: {sys.executable}\n")
+            f.write(f"cmd: {cmd_str}\n")
+            f.write(f"CUDA_VISIBLE_DEVICES: {env['CUDA_VISIBLE_DEVICES']}\n")
+            f.write(f"OMP_NUM_THREADS: {env['OMP_NUM_THREADS']}\n")
+            f.write(f"MKL_NUM_THREADS: {env['MKL_NUM_THREADS']}\n")
+            f.write(f"OPENBLAS_NUM_THREADS: {env['OPENBLAS_NUM_THREADS']}\n")
+            f.write(f"NUMEXPR_NUM_THREADS: {env['NUMEXPR_NUM_THREADS']}\n")
+            f.write(f"WANDB_START_METHOD: {env.get('WANDB_START_METHOD')}\n")
+            f.write(f"WANDB__SERVICE_WAIT: {env.get('WANDB__SERVICE_WAIT')}\n")
+            f.write("=" * 100 + "\n\n")
+            f.flush()
 
-    cmd_str = " ".join(shlex.quote(x) for x in argv)
+        if dry_run:
+            logging.info("[dry-run] not launching subprocess for env=%s seed=%s", env_id, seed)
+            return {
+                "env_id": env_id,
+                "seed": seed,
+                "gpu": gpu,
+                "returncode": 0,
+                "elapsed_sec": 0.0,
+                "log_path": str(log_path),
+                "cmd": cmd_str,
+                "dry_run": True,
+            }
 
-    print("=" * 100, flush=True)
-    print(f"[launch] env={env_id} seed={seed} gpu={gpu}", flush=True)
-    print(f"[launch] log={log_path}", flush=True)
-    print(f"[launch] cmd={cmd_str}", flush=True)
+        start = time.time()
 
-    if dry_run:
+        with log_path.open("a", encoding="utf-8") as f:
+            proc = subprocess.run(
+                argv,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+        elapsed = time.time() - start
+
+        result = {
+            "env_id": env_id,
+            "seed": seed,
+            "gpu": gpu,
+            "returncode": proc.returncode,
+            "elapsed_sec": elapsed,
+            "log_path": str(log_path),
+            "cmd": cmd_str,
+            "dry_run": False,
+        }
+
+        if proc.returncode != 0:
+            logging.error(
+                "[run failed] env=%s seed=%s gpu=%s returncode=%s log=%s",
+                env_id,
+                seed,
+                gpu,
+                proc.returncode,
+                log_path,
+            )
+            logging.error("last lines of failed log:\n%s", tail_file(log_path, n=100))
+        else:
+            logging.info(
+                "[run ok] env=%s seed=%s gpu=%s elapsed_sec=%.1f",
+                env_id,
+                seed,
+                gpu,
+                elapsed,
+            )
+
+        return result
+
+    except Exception as e:
+        logging.exception(
+            "[launcher exception before/during subprocess] env=%s seed=%s gpu=%s error=%r",
+            env_id,
+            seed,
+            gpu,
+            e,
+        )
         return {
             "env_id": env_id,
             "seed": seed,
             "gpu": gpu,
-            "returncode": 0,
+            "returncode": -999,
             "elapsed_sec": 0.0,
-            "log_path": str(log_path),
-            "cmd": cmd_str,
-            "dry_run": True,
+            "log_path": "",
+            "cmd": "",
+            "dry_run": dry_run,
+            "error": repr(e),
         }
-
-    start = time.time()
-
-    with log_path.open("w", encoding="utf-8") as f:
-        f.write(f"[cmd] {cmd_str}\n")
-        f.write(f"[env] CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}\n")
-        f.write(f"[env] OMP_NUM_THREADS={env['OMP_NUM_THREADS']}\n")
-        f.write(f"[env] MKL_NUM_THREADS={env['MKL_NUM_THREADS']}\n")
-        f.flush()
-
-        proc = subprocess.run(
-            argv,
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-
-    elapsed = time.time() - start
-
-    return {
-        "env_id": env_id,
-        "seed": seed,
-        "gpu": gpu,
-        "returncode": proc.returncode,
-        "elapsed_sec": elapsed,
-        "log_path": str(log_path),
-        "cmd": cmd_str,
-        "dry_run": False,
-    }
 
 
 def run_gpu_queue(
@@ -466,18 +502,22 @@ def run_gpu_queue(
     cpus_per_run: int,
     extra_args: List[str],
     dry_run: bool,
+    fail_fast: bool,
 ) -> List[Dict[str, object]]:
-    """
-    Run all tasks assigned to one GPU sequentially.
-
-    One thread controls one GPU. This gives parallelism across GPUs without
-    letting two subprocesses accidentally use the same GPU at once.
-    """
     results: List[Dict[str, object]] = []
 
-    print(f"[gpu-worker] gpu={gpu} assigned {len(tasks)} tasks", flush=True)
+    logging.info("[gpu-worker] gpu=%s assigned %d tasks", gpu, len(tasks))
 
-    for env_id, seed in tasks:
+    for idx, (env_id, seed) in enumerate(tasks, start=1):
+        logging.info(
+            "[gpu-worker] gpu=%s starting task %d/%d: env=%s seed=%s",
+            gpu,
+            idx,
+            len(tasks),
+            env_id,
+            seed,
+        )
+
         result = run_one_cleanrl_subprocess(
             script=script,
             env_id=env_id,
@@ -496,20 +536,20 @@ def run_gpu_queue(
         results.append(result)
 
         status = "OK" if result["returncode"] == 0 else "FAIL"
-        print(
-            f"[done:{status}] gpu={gpu} env={env_id} seed={seed} "
-            f"returncode={result['returncode']} elapsed_sec={result['elapsed_sec']:.1f} "
-            f"log={result['log_path']}",
-            flush=True,
+        logging.info(
+            "[done:%s] gpu=%s env=%s seed=%s returncode=%s elapsed_sec=%s log=%s",
+            status,
+            gpu,
+            env_id,
+            seed,
+            result.get("returncode"),
+            result.get("elapsed_sec"),
+            result.get("log_path"),
         )
 
-        # Continue even if one game fails. At the end, the launcher exits nonzero
-        # if there were failures.
-        if result["returncode"] != 0:
-            print(
-                f"[warn] run failed but continuing queue: gpu={gpu} env={env_id} seed={seed}",
-                flush=True,
-            )
+        if fail_fast and result["returncode"] != 0:
+            logging.error("[fail-fast] stopping GPU queue after failure on gpu=%s", gpu)
+            break
 
     return results
 
@@ -526,44 +566,30 @@ def write_results_csv(results: List[Dict[str, object]], out_path: Path) -> None:
         "log_path",
         "dry_run",
         "cmd",
+        "error",
     ]
 
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
 
-        for r in sorted(results, key=lambda x: (str(x["env_id"]), int(x["seed"]))):
+        for r in sorted(results, key=lambda x: (str(x.get("env_id")), int(x.get("seed", -1)))):
             writer.writerow({k: r.get(k, "") for k in fields})
 
 
-def main() -> None:
+def parse_args():
     p = argparse.ArgumentParser()
 
     p.add_argument("--script", type=str, default="cleanrl/ppo_atari_envpool.py")
-    p.add_argument(
-        "--best-summary-file",
-        type=str,
-        required=True,
-        help="Path to Optuna summary .txt file. Best hparams are parsed from this file.",
-    )
-    p.add_argument(
-        "--optimizer",
-        type=str,
-        required=True,
-        help="Optimizer string to pass to CleanRL, e.g. Adam, Muon, RLMuon, NorMuon, AdaMuon.",
-    )
+    p.add_argument("--best-summary-file", type=str, required=True)
+    p.add_argument("--optimizer", type=str, required=True)
 
     p.add_argument("--gpus", type=str, default="0")
     p.add_argument("--num-seeds", type=int, default=10)
     p.add_argument("--seed-start", type=int, default=1)
 
     p.add_argument("--game-set", type=str, default="eval30", choices=["eval30", "tuning8"])
-    p.add_argument(
-        "--games",
-        type=str,
-        default=None,
-        help="Optional comma-separated game override, e.g. Pong-v5,Breakout-v5,Qbert-v5",
-    )
+    p.add_argument("--games", type=str, default=None)
 
     p.add_argument("--total-timesteps", type=int, default=5_000_000)
     p.add_argument("--num-envs", type=int, default=32)
@@ -576,141 +602,172 @@ def main() -> None:
     p.add_argument("--logs-root", type=str, default="eval_logs")
     p.add_argument("--summary-csv", type=str, default=None)
 
-    p.add_argument(
-        "--cpus-per-run",
-        type=int,
-        default=8,
-        help="CPU threads assigned to each single-GPU subprocess.",
-    )
+    p.add_argument("--cpus-per-run", type=int, default=8)
 
     p.add_argument(
         "--extra-arg",
         action="append",
         default=[],
         help=(
-            "Extra arg passed through literally to CleanRL script. "
-            "For flags beginning with --, use equals syntax, e.g. "
-            "--extra-arg=--torch-deterministic=False"
+            "Extra arg passed literally to CleanRL. For flags beginning with --, "
+            "use equals syntax, e.g. --extra-arg=--torch-deterministic=False"
         ),
     )
 
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--fail-fast", action="store_true")
 
-    args = p.parse_args()
+    return p.parse_args()
 
-    gpus = [int(x) for x in args.gpus.split(",") if x.strip()]
-    if not gpus:
-        raise ValueError("No GPUs provided. Use --gpus 0,1,2,...")
 
-    game_override = parse_csv_list(args.games)
-    if game_override is not None:
-        games = game_override
-    elif args.game_set == "tuning8":
-        games = TUNING_GAMES
-    else:
-        games = ATARI_EVAL_GAMES
+def main() -> None:
+    args = parse_args()
+    launcher_log = setup_logging(args.logs_root, args.wandb_tag)
 
-    seeds = list(range(args.seed_start, args.seed_start + args.num_seeds))
+    try:
+        logging.info("argv: %s", " ".join(shlex.quote(x) for x in sys.argv))
+        logging.info("cwd: %s", os.getcwd())
+        logging.info("python executable: %s", sys.executable)
+        logging.info("python version: %s", sys.version.replace("\n", " "))
+        logging.info("launcher log: %s", launcher_log)
 
-    print("=" * 100)
-    print("[eval] loading best hyperparameters from summary file")
-    print(f"[eval] best_summary_file={args.best_summary_file}")
+        logging.info("parsed args:")
+        for k, v in sorted(vars(args).items()):
+            logging.info("  %s: %r", k, v)
 
-    best_params = load_best_params_from_summary(args.best_summary_file)
-    run_config = parse_run_config_from_summary(args.best_summary_file)
+        script_path = Path(args.script)
+        summary_path = Path(args.best_summary_file)
 
-    print("[eval] parsed best params")
-    for k, v in best_params.items():
-        print(f"  {k}: {v}")
+        logging.info("script path exists: %s -> %s", script_path, script_path.exists())
+        logging.info("summary path exists: %s -> %s", summary_path, summary_path.exists())
 
-    if run_config:
-        print("[eval] summary-file run config sanity info")
-        for key in ["study_name", "wandb_tag", "optimizer", "metric", "metric_window", "trials", "seeds"]:
-            if key in run_config:
-                print(f"  {key}: {run_config[key]}")
+        if not script_path.exists():
+            raise FileNotFoundError(f"CleanRL script does not exist: {script_path.resolve()}")
 
-    cleanrl_params = best_params_to_cleanrl_flags(
-        best_params=best_params,
-        optimizer=args.optimizer,
-        total_timesteps=args.total_timesteps,
-        num_envs=args.num_envs,
-        num_steps=args.num_steps,
-    )
+        if not summary_path.exists():
+            raise FileNotFoundError(f"Best summary file does not exist: {summary_path.resolve()}")
 
-    print("[eval] CleanRL flags that will be used")
-    for k, v in cleanrl_params.items():
-        print(f"  --{k} {v}")
+        gpus = [int(x) for x in args.gpus.split(",") if x.strip()]
+        if not gpus:
+            raise ValueError("No GPUs provided. Use --gpus 0,1,2,...")
 
-    tasks = build_tasks(games, seeds)
-    tasks_by_gpu = split_tasks_across_gpus(tasks, gpus)
+        game_override = parse_csv_list(args.games)
+        if game_override is not None:
+            games = game_override
+        elif args.game_set == "tuning8":
+            games = TUNING_GAMES
+        else:
+            games = ATARI_EVAL_GAMES
 
-    summary_csv = (
-        Path(args.summary_csv)
-        if args.summary_csv
-        else Path(args.logs_root) / f"{safe_slug(args.wandb_tag)}__eval_summary.csv"
-    )
+        seeds = list(range(args.seed_start, args.seed_start + args.num_seeds))
 
-    print("=" * 100)
-    print(f"[eval] games: {len(games)}")
-    print(f"[eval] seeds per game: {len(seeds)}")
-    print(f"[eval] total runs: {len(tasks)}")
-    print(f"[eval] GPUs: {gpus}")
-    print(f"[eval] max parallel runs: {len(gpus)}")
-    print(f"[eval] logs_root: {args.logs_root}")
-    print(f"[eval] summary_csv: {summary_csv}")
-    print(f"[eval] wandb_project_name: {args.wandb_project_name}")
-    print(f"[eval] wandb_tag: {args.wandb_tag}")
-    print("=" * 100)
+        logging.info("selected games (%d): %s", len(games), games)
+        logging.info("selected seeds (%d): %s", len(seeds), seeds)
+        logging.info("selected GPUs (%d): %s", len(gpus), gpus)
 
-    all_results: List[Dict[str, object]] = []
+        best_params = load_best_params_from_summary(args.best_summary_file)
+        run_config = parse_run_config_from_summary(args.best_summary_file)
 
-    with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
-        futures = []
+        logging.info("parsed best params:")
+        for k, v in best_params.items():
+            logging.info("  %s: %r", k, v)
 
+        if run_config:
+            logging.info("summary run config:")
+            for k, v in sorted(run_config.items()):
+                logging.info("  %s: %s", k, v)
+
+        cleanrl_params = best_params_to_cleanrl_flags(
+            best_params=best_params,
+            optimizer=args.optimizer,
+            total_timesteps=args.total_timesteps,
+            num_envs=args.num_envs,
+            num_steps=args.num_steps,
+        )
+
+        tasks = build_tasks(games, seeds)
+        tasks_by_gpu = split_tasks_across_gpus(tasks, gpus)
+
+        logging.info("=" * 100)
+        logging.info("total tasks: %d", len(tasks))
         for gpu in gpus:
-            futures.append(
-                executor.submit(
-                    run_gpu_queue,
-                    gpu=gpu,
-                    tasks=tasks_by_gpu[gpu],
-                    script=args.script,
-                    cleanrl_params=cleanrl_params,
-                    wandb_project_name=args.wandb_project_name,
-                    wandb_tag=args.wandb_tag,
-                    wandb_entity=args.wandb_entity,
-                    logs_root=args.logs_root,
-                    cpus_per_run=args.cpus_per_run,
-                    extra_args=args.extra_arg,
-                    dry_run=args.dry_run,
+            logging.info("gpu=%s gets %d tasks", gpu, len(tasks_by_gpu[gpu]))
+            preview = tasks_by_gpu[gpu][:5]
+            logging.info("gpu=%s first tasks: %s", gpu, preview)
+        logging.info("=" * 100)
+
+        summary_csv = (
+            Path(args.summary_csv)
+            if args.summary_csv
+            else Path(args.logs_root) / f"{safe_slug(args.wandb_tag)}__eval_summary.csv"
+        )
+
+        all_results: List[Dict[str, object]] = []
+
+        with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
+            futures = []
+
+            for gpu in gpus:
+                futures.append(
+                    executor.submit(
+                        run_gpu_queue,
+                        gpu=gpu,
+                        tasks=tasks_by_gpu[gpu],
+                        script=args.script,
+                        cleanrl_params=cleanrl_params,
+                        wandb_project_name=args.wandb_project_name,
+                        wandb_tag=args.wandb_tag,
+                        wandb_entity=args.wandb_entity,
+                        logs_root=args.logs_root,
+                        cpus_per_run=args.cpus_per_run,
+                        extra_args=args.extra_arg,
+                        dry_run=args.dry_run,
+                        fail_fast=args.fail_fast,
+                    )
                 )
-            )
 
-        for fut in as_completed(futures):
-            gpu_results = fut.result()
-            all_results.extend(gpu_results)
+            for fut in as_completed(futures):
+                try:
+                    gpu_results = fut.result()
+                    all_results.extend(gpu_results)
+                    write_results_csv(all_results, summary_csv)
+                    logging.info("wrote incremental summary csv: %s", summary_csv)
+                except Exception:
+                    logging.exception("GPU worker future crashed")
+                    if args.fail_fast:
+                        raise
 
-            # Incremental checkpoint of launcher-level results.
-            write_results_csv(all_results, summary_csv)
+        write_results_csv(all_results, summary_csv)
 
-    write_results_csv(all_results, summary_csv)
+        failures = [r for r in all_results if r.get("returncode") != 0]
 
-    failures = [r for r in all_results if r.get("returncode") != 0]
+        logging.info("=" * 100)
+        logging.info("evaluation finished")
+        logging.info("total results: %d", len(all_results))
+        logging.info("failures: %d", len(failures))
+        logging.info("summary_csv: %s", summary_csv)
+        logging.info("launcher_log: %s", launcher_log)
 
-    print("=" * 100)
-    print("[eval] finished")
-    print(f"[eval] total runs: {len(all_results)}")
-    print(f"[eval] failures:   {len(failures)}")
-    print(f"[eval] summary_csv: {summary_csv}")
+        if failures:
+            logging.error("failed runs:")
+            for r in failures:
+                logging.error(
+                    "  env=%s seed=%s gpu=%s returncode=%s log=%s error=%s",
+                    r.get("env_id"),
+                    r.get("seed"),
+                    r.get("gpu"),
+                    r.get("returncode"),
+                    r.get("log_path"),
+                    r.get("error", ""),
+                )
 
-    if failures:
-        print("[eval] failed runs:")
-        for r in failures:
-            print(
-                f"  env={r.get('env_id')} seed={r.get('seed')} "
-                f"gpu={r.get('gpu')} log={r.get('log_path')}"
-            )
+            raise SystemExit(1)
 
-        raise SystemExit(1)
+    except SystemExit:
+        raise
+    except Exception:
+        logging.exception("fatal launcher crash")
+        raise
 
 
 if __name__ == "__main__":

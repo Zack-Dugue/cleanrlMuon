@@ -19,7 +19,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCRIPT="cleanrl/ppo_atari_envpool.py"
-EVAL_LAUNCHER="eval_best_hparams_from_summary_envpool.py"
+EVAL_LAUNCHER="best_run_eval.py"
 
 # This is now the source of truth for the best hyperparameters.
 # It should be the summary .txt written by write_optuna_summary_file().
