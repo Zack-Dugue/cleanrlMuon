@@ -570,7 +570,7 @@ class ConvSimpleAgent(nn.Module):
 
         if self.use_muon_input:
             muon_params.extend([
-                self.conv1.weight,
+                # self.conv1.weight,
                 self.conv2.weight,
                 self.conv3.weight,
             ])
