@@ -14,7 +14,6 @@ hyperparameters.
 
 Default fixed params:
   lr                = 0.00075
-  aux_learning_rate = 0.00075
   ent_coef          = 0.01
   momentum          = 0.95
   update_epochs     = 5
@@ -139,7 +138,6 @@ def fixed_cleanrl_params(
     *,
     optimizer: str,
     learning_rate: float,
-    aux_learning_rate: float,
     ent_coef: float,
     momentum: float,
     update_epochs: int,
@@ -149,7 +147,6 @@ def fixed_cleanrl_params(
 ) -> Dict[str, object]:
     return {
         "learning-rate": float(learning_rate),
-        "aux-learning-rate": float(aux_learning_rate),
         "ent-coef": float(ent_coef),
         "update-epochs": int(update_epochs),
         "momentum": float(momentum),
@@ -442,7 +439,6 @@ def run_gpu_queue(
         cleanrl_params = fixed_cleanrl_params(
             optimizer=optimizer,
             learning_rate=fixed_args.learning_rate,
-            aux_learning_rate=fixed_args.aux_learning_rate,
             ent_coef=fixed_args.ent_coef,
             momentum=fixed_args.momentum,
             update_epochs=fixed_args.update_epochs,
@@ -625,7 +621,6 @@ def main() -> None:
 
         logging.info("fixed hyperparameters:")
         logging.info("  learning_rate:     %s", args.learning_rate)
-        logging.info("  aux_learning_rate: %s", args.aux_learning_rate)
         logging.info("  ent_coef:          %s", args.ent_coef)
         logging.info("  momentum:          %s", args.momentum)
         logging.info("  update_epochs:     %s", args.update_epochs)
