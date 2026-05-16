@@ -547,7 +547,6 @@ def parse_args():
 
     # Fixed hyperparameters.
     p.add_argument("--learning-rate", type=float, default=0.00075)
-    p.add_argument("--aux-learning-rate", type=float, default=0.00075)
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--momentum", type=float, default=0.95)
     p.add_argument("--update-epochs", type=int, default=5)
