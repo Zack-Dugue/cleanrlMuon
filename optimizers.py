@@ -169,18 +169,24 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 g_eff = g.lerp(buf, momentum) if nesterov else buf
 
                 if g_eff.ndim == 4:
-                    g_eff = g_eff.view(len(g_eff), -1)
-                z = zeropower_via_newtonschulz5(g_eff, steps=ns_steps).flatten()
+                    g_mat = g_eff.view(g_eff.size(0), -1)  # [out_channels, in_channels * kh * kw]
+                elif g_eff.ndim > 2:
+                    g_mat = g_eff.view(g_eff.size(0), -1)
+                else:
+                    g_mat = g_eff
+
+                z = zeropower_via_newtonschulz5(g_mat, steps=ns_steps)
 
                 if wd != 0:
                     p.mul_(1 - lr * wd)
 
-                if p.ndim >= 2:
-                    scale = (-lr) * 0.2 * (max(p.size(-2), p.size(-1)) ** 0.5)
+                if g_mat.ndim == 2:
+                    scale = (-lr) * 0.2 * (max(g_mat.size(0), g_mat.size(1)) ** 0.5)
                 else:
                     scale = -lr * 0.2
 
                 p.add_(z.view_as(p), alpha=scale)
+
             return
 
         # ---- Distributed path (unchanged semantics) ----
@@ -357,108 +363,129 @@ class AdaMuonWithAuxAdam(torch.optim.Optimizer):
     def _step_adamuon_group(self, group: dict):
         """
         AdaMuon path:
-          momentum (+ optional Nesterov) -> zeropower on sign(g) -> per-param variance buffer v
-          -> normalize by sqrt(v)+eps -> heuristic scaling -> (decoupled WD) -> param update
-          Dist path uses all_gather; single-process path bypasses collectives.
+          momentum (+ optional Nesterov)
+          -> zeropower on sign(g) in 2D matrix form
+          -> per-param variance buffer v
+          -> normalize by sqrt(v)+eps
+          -> heuristic scaling
+          -> decoupled WD
+          -> param update
+
+        Dist path uses all_gather; single-process path bypasses collectives.
         """
-        lr = group["lr"]; wd = group["weight_decay"]
-        momentum = group["momentum"]; nesterov = group["nesterov"]
-        ns_steps = group["ns_steps"]; eps = group["eps"]
+        lr = group["lr"]
+        wd = group["weight_decay"]
+        momentum = group["momentum"]
+        nesterov = group["nesterov"]
+        ns_steps = group["ns_steps"]
+        eps = group["eps"]
 
         params = group["params"]
 
-        # ---- Change 2: single-process fast path ----
+        def make_2d(x: Tensor) -> Tensor:
+            # Muon/Newton-Schulz wants matrices.
+            # Linear: [out, in] stays [out, in]
+            # Conv: [out, in, kh, kw] -> [out, in*kh*kw]
+            # 1D params should normally not be routed to Muon, but this keeps it safe.
+            if x.ndim >= 2:
+                return x.reshape(x.shape[0], -1)
+            return x.reshape(1, -1)
+
+        def compute_adamuon_update(p: Tensor, g: Tensor) -> Tensor:
+            st = self.state[p]
+
+            if "momentum_buffer" not in st:
+                st["momentum_buffer"] = torch.zeros_like(g)
+
+            buf: Tensor = st["momentum_buffer"]
+            buf.mul_(momentum).add_(g)
+
+            if nesterov:
+                g_mom = g.add(buf, alpha=momentum)
+            else:
+                g_mom = buf
+
+            g_flat = make_2d(g_mom)
+
+            # This preserves your AdaMuon-ish "sign before zeropower" behavior.
+            z = zeropower_via_newtonschulz5(torch.sign(g_flat), steps=ns_steps)
+
+            if ("v_buffer" not in st) or (st["v_buffer"].shape != z.shape):
+                st["v_buffer"] = torch.zeros_like(z)
+
+            v: Tensor = st["v_buffer"]
+
+            # Correct torch addcmul_ signature:
+            #   v = momentum * v + (1 - momentum) * z * z
+            v.mul_(momentum).addcmul_(z, z, value=1 - momentum)
+
+            z = z / (v.sqrt().add(eps))
+
+            # Heuristic normalization. Uses the actual 2D matrix shape after flattening.
+            rows, cols = z.shape
+            scale = 0.2 * ((rows * cols) ** 0.5) / (z.norm() + eps)
+            z.mul_(scale)
+
+            return z.reshape_as(p)
+
+        # ---- Single-process fast path ----
         if (not self._dist_ready) or self.world_size == 1:
             for p in params:
                 g = p.grad
                 if g is None:
                     continue
 
-                st = self.state[p]
-                if "momentum_buffer" not in st:
-                    st["momentum_buffer"] = torch.zeros_like(g)
-                buf: Tensor = st["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                g_mom = g.add(buf, alpha=momentum) if nesterov else buf
-
-                g_flat = g_mom
-                if g_flat.ndim >= 2:
-                    g_flat.flatten(0,-1)
-
-
-                z = zeropower_via_newtonschulz5(torch.sign(g_flat), steps=ns_steps)
-
-                if "v_buffer" not in st:
-                    st["v_buffer"] = torch.zeros_like(z)
-                v = st["v_buffer"]
-                v.mul_(momentum).addcmul_(1 - momentum, z, z)
-
-                z = z / (v.sqrt().add(eps))
-
-                scale = 0.2 * (min(p.shape) * max(p.shape)) ** 0.5 / (z.norm() + eps)
-                z.mul_(scale)
+                z = compute_adamuon_update(p, g)
 
                 if wd != 0:
                     p.mul_(1 - lr * wd)
-                p.add_(z.view_as(p), alpha=-lr)
+
+                p.add_(z, alpha=-lr)
+
             return
 
-        # ---- Distributed path (unchanged semantics) ----
+        # ---- Distributed path ----
         update_buffer: Tensor = group["update_buffer"]
         update_buffer_views: list[Tensor] = group["update_buffer_views"]
+
         handle = None
         params_world = None
 
         def flush_prev():
             handle.wait()
-            for p_world, g_world in zip(params_world, update_buffer_views):
+
+            for p_world, z_world in zip(params_world, update_buffer_views):
+                if p_world.grad is None:
+                    continue
+
                 if wd != 0:
                     p_world.mul_(1 - lr * wd)
-                p_world.add_(g_world.view_as(p_world), alpha=-lr)
+
+                p_world.add_(z_world.view_as(p_world), alpha=-lr)
 
         for base_i in range(0, len(params), self.world_size):
-            if base_i + self.rank < len(params):
-                p = params[base_i + self.rank]
+            local_i = base_i + self.rank
+
+            if local_i < len(params):
+                p = params[local_i]
                 g = p.grad
 
                 if g is None:
-                    z = update_buffer_views[self.rank]
+                    z = torch.zeros_like(update_buffer_views[self.rank])
                 else:
-                    st = self.state[p]
-                    if "momentum_buffer" not in st:
-                        st["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = st["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    g_mom = g.add(buf, alpha=momentum) if nesterov else buf
-
-                    g_flat = g_mom
-                    if g_flat.ndim == 4:
-                        g_flat = g_flat.view(len(g_flat), -1)
-                    g_flat = g_flat.flatten()
-
-                    z = zeropower_via_newtonschulz5(torch.sign(g_flat), steps=ns_steps)
-
-                    if "v_buffer" not in st:
-                        st["v_buffer"] = torch.zeros_like(z)
-                    v = st["v_buffer"]
-                    v.mul_(momentum).addcmul_(1 - momentum, z, z)
-                    z = z / (v.sqrt().add(eps))
-
-                    scale = 0.2 * (min(p.shape) * max(p.shape)) ** 0.5 / (z.norm() + eps)
-                    z.mul_(scale)
-
-                    z = z.to(update_buffer.dtype)
+                    z = compute_adamuon_update(p, g)
+                    z = z.to(update_buffer.dtype).reshape(-1)
             else:
-                z = update_buffer_views[self.rank]
+                z = torch.zeros_like(update_buffer_views[self.rank])
 
             if base_i > 0:
                 flush_prev()
+
             handle = dist.all_gather_into_tensor(update_buffer, z, async_op=True)
             params_world = params[base_i: base_i + self.world_size]
 
         if handle is not None:
             flush_prev()
-
 
 # ==============================
 # MuonWithAuxAdam (normalized Muon + aux AdamW)
