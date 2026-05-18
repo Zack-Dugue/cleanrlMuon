@@ -27,7 +27,7 @@ trap 'echo ""; echo "========== JOB FAILED =========="; echo "Exit code: $?"; ec
 SCRIPT="cleanrl/ppo_atari_envpool.py"
 EVAL_LAUNCHER="eval_fixed_hparams_envpool.py"
 
-OPTIMIZERS="Adam,Muon"
+OPTIMIZERS="Muon, AdaMuon"
 
 LEARNING_RATE="0.00075"
 AUX_LEARNING_RATE="0.00075"
@@ -46,7 +46,7 @@ GPUS="0,1,2,3,4,5,6,7"
 CPUS_PER_RUN="16"
 
 WANDB_PROJECT="cleanrl-atari-fixed-hparam-eval"
-WANDB_TAG_PREFIX="fixed_lr00075_aux00075_ent001_mom095_10M"
+WANDB_TAG_PREFIX="fixed_run_fixed_optimizers"
 
 LOGS_ROOT="eval_logs/${WANDB_TAG_PREFIX}"
 
