@@ -96,10 +96,10 @@ def default_params_fn(optimizer_name: str):
         return {
             # Tunables, kebab-case flags as expected by your CleanRL script.
             "learning-rate": trial.suggest_float("lr", 3e-5, 3e-3, log=True),
-            "aux-learning-rate": trial.suggest_float("aux-learning-rate", 3e-5, 3e-3, log=True),
-            "ent-coef": trial.suggest_float("ent_coef", 0.01, 0.01),
+            "ent-coef": trial.suggest_float("ent_coef", 0.001, 0.03),
+            "clip-coef": trial.suggest_float("clip_coef", 0.05, .3),
             "update-epochs": trial.suggest_int("update_epochs", 5, 5),
-            "momentum": trial.suggest_float("momentum", 0.9, 0.99),
+            "momentum": trial.suggest_float("momentum", 0.95, 0.95),
 
             # Fixed batch shape / run length.
             "num-envs": 32,
