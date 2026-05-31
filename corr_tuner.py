@@ -8,7 +8,7 @@ It tunes exactly:
   - clip-coef
   - ent-coef
 
-It passes Tyro-compatible boolean flags through to the training script:
+It passes --use-correlation-weighting=True/False through to the training script,
 runs a multi-game Atari subset, normalizes returns, and writes the best result
 to JSON for later evaluation.
 
@@ -154,16 +154,9 @@ def run_one(
         f"--num-steps={args.num_steps}",
         f"--num-minibatches={args.num_minibatches}",
         f"--total-timesteps={args.total_timesteps}",
+        f"--use-correlation-weighting={args.use_correlation_weighting}",
         f"--exp-name={exp_name}",
     ]
-
-    # Tyro boolean flags should be passed by presence/negation, not as =True/=False.
-    # With use_correlation_weighting defaulting to True in the training script, this is
-    # still explicit for both ablation branches.
-    if args.use_correlation_weighting:
-        cmd.append("--use-correlation-weighting")
-    else:
-        cmd.append("--no-use-correlation-weighting")
 
     if args.aux_learning_rate is not None:
         cmd.append(f"--aux-learning-rate={args.aux_learning_rate}")
@@ -227,7 +220,7 @@ def write_best_artifacts(args, study: optuna.Study, best: optuna.trial.FrozenTri
             f"--clip-coef={best.params.get('clip_coef')} "
             f"--ent-coef={best.params.get('ent_coef')} "
             f"--update-epochs={args.update_epochs} "
-            f"{'--use-correlation-weighting' if args.use_correlation_weighting else '--no-use-correlation-weighting'}"
+            f"--use-correlation-weighting={bool(args.use_correlation_weighting)}"
         ),
         "all_trials": [
             {
