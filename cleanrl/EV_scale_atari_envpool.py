@@ -325,7 +325,7 @@ class Args:
     seed: int = 1
     torch_deterministic: bool = True
     cuda: bool = True
-    track: bool = False
+    track: bool = True
     wandb_project_name: str = "cleanRL"
     wandb_entity: str = None
     wandb_tag: str = None
