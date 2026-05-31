@@ -3,7 +3,7 @@ import os
 import random
 import time
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from collections import deque
 from typing import Dict, Any
 
@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import tyro
+import argparse
 from mpmath import beta
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
@@ -384,13 +384,97 @@ class Args:
     minibatch_size: int = 0
     num_iterations: int = 0
 
+
+def _str2bool(v):
+    """
+    argparse-compatible bool parser that accepts:
+      --flag
+      --flag=true
+      --flag=True
+      --flag false
+      --no-flag
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return True
+    v = str(v).strip().lower()
+    if v in ("yes", "true", "t", "1", "y", "on"):
+        return True
+    if v in ("no", "false", "f", "0", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {v!r}")
+
+
+def _arg_type_for_field(name, default):
+    """
+    Infer argparse type from the dataclass default. For None defaults,
+    use a small explicit map matching this script's optional args.
+    """
+    if isinstance(default, bool):
+        return _str2bool
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int
+    if isinstance(default, float):
+        return float
+    if default is None:
+        none_type_map = {
+            "wandb_entity": str,
+            "wandb_tag": str,
+            "device": str,
+            "target_kl": float,
+            "aux_learning_rate": float,
+        }
+        return none_type_map.get(name, str)
+    return type(default)
+
+
+def parse_args() -> Args:
+    """
+    Replacement for tyro.cli(Args).
+
+    This deliberately accepts explicit bool values because the HPO launcher emits
+    args like --use-correlation-weighting=True/False. It also accepts normal
+    presence/absence flags and --no-* negations.
+    """
+    parser = argparse.ArgumentParser()
+    defaults = Args()
+
+    for f in fields(Args):
+        name = f.name
+        default = getattr(defaults, name)
+        cli_name = "--" + name.replace("_", "-")
+
+        if isinstance(default, bool):
+            parser.add_argument(
+                cli_name,
+                nargs="?",
+                const=True,
+                default=default,
+                type=_str2bool,
+            )
+            parser.add_argument(
+                "--no-" + name.replace("_", "-"),
+                dest=name,
+                action="store_false",
+            )
+        else:
+            parser.add_argument(
+                cli_name,
+                default=default,
+                type=_arg_type_for_field(name, default),
+            )
+
+    ns = parser.parse_args()
+    return Args(**vars(ns))
+
 #Need to fix the whole 'unpicklable nested function' thing BUT
 # We should ditch the gpu environment thing, and
 # Just directly set the GPU and the number of threads in multigpu_tuner_spv.
 
 # ----------------------------- main -----------------------------
 if __name__ == "__main__":
-    args = tyro.cli(Args)
+    args = parse_args()
     if args.device:
         device = torch.device(args.device)
     else:
