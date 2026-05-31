@@ -326,7 +326,7 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = True
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "corr_ppo_project"
     wandb_entity: str = None
     wandb_tag: str = None
     capture_video: bool = False  # EnvPool path doesn’t record videos by default
