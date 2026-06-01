@@ -269,7 +269,7 @@ def write_best_artifacts(args, study: optuna.Study, best: optuna.trial.FrozenTri
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--script", type=str, default="cleanrl/corr_scale_PPO_atari_envpool.py")
+    p.add_argument("--script", type=str, default="cleanrl/corr_scale_atari_envpool.py")
     p.add_argument("--metric", type=str, default="charts/episodic_return")
     p.add_argument("--metric-window", type=int, default=50)
     p.add_argument("--gpus", type=str, default="0")
