@@ -164,7 +164,6 @@ def run_one(
         f"--total-timesteps={args.total_timesteps}",
         f"--use-correlation-weighting={args.use_correlation_weighting}",
         f"--correlation-scale-floor={args.correlation_scale_floor}",
-        f"--scale-value-clip-by-correlation={args.scale_value_clip_by_correlation}",
         f"--exp-name={exp_name}",
     ]
 
@@ -288,9 +287,7 @@ def main() -> None:
     p.add_argument("--momentum", type=float, default=None)
     p.add_argument("--aux-learning-rate", type=float, default=None)
     p.add_argument("--correlation-scale-floor", type=float, default=0.01)
-    p.add_argument("--scale-value-clip-by-correlation", dest="scale_value_clip_by_correlation", action="store_true")
-    p.add_argument("--no-scale-value-clip-by-correlation", dest="scale_value_clip_by_correlation", action="store_false")
-    p.set_defaults(scale_value_clip_by_correlation=False)
+
 
     p.add_argument("--use-correlation-weighting", dest="use_correlation_weighting", action="store_true")
     p.add_argument("--no-use-correlation-weighting", dest="use_correlation_weighting", action="store_false")
