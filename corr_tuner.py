@@ -78,7 +78,7 @@ def safe_slug(x: object) -> str:
 def trial_params(trial: optuna.Trial) -> dict:
     return {
         "learning-rate": trial.suggest_float("lr", 3e-5, 3e-3, log=True),
-        "clip-coef": trial.suggest_float("clip_coef", 0.05, 0.30),
+        "clip-coef": trial.suggest_float("clip_coef", 0.05, 0.50),
         "ent-coef": trial.suggest_float("ent_coef", 0.001, 0.03),
     }
 
@@ -218,7 +218,6 @@ def write_best_artifacts(args, study: optuna.Study, best: optuna.trial.FrozenTri
             "num_minibatches": args.num_minibatches,
             "total_timesteps": args.total_timesteps,
             "correlation_scale_floor": args.correlation_scale_floor,
-            "scale_value_clip_by_correlation": args.scale_value_clip_by_correlation,
             "seeds": args.seeds,
             "metric": args.metric,
             "metric_window": args.metric_window,
@@ -233,7 +232,6 @@ def write_best_artifacts(args, study: optuna.Study, best: optuna.trial.FrozenTri
             f"--update-epochs={args.update_epochs} "
             f"--use-correlation-weighting={bool(args.use_correlation_weighting)} "
             f"--correlation-scale-floor={args.correlation_scale_floor} "
-            f"--scale-value-clip-by-correlation={bool(args.scale_value_clip_by_correlation)}"
         ),
         "all_trials": [
             {
