@@ -270,7 +270,7 @@ def main() -> None:
     p.add_argument("--metric", type=str, default="charts/episodic_return")
     p.add_argument("--metric-window", type=int, default=50)
     p.add_argument("--gpus", type=str, default="0")
-    p.add_argument("--optimizer", type=str, default="RLMuon")
+    p.add_argument("--optimizer", type=str, default="AdaMuon")
     p.add_argument("--trials", type=int, default=20)
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--study-name", type=str, default="corr_weighting_study")
