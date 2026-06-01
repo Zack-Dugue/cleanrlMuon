@@ -77,7 +77,7 @@ def safe_slug(x: object) -> str:
 
 def trial_params(trial: optuna.Trial) -> dict:
     return {
-        "learning-rate": trial.suggest_float("lr", 3e-5, 3e-3, log=True),
+        "learning-rate": trial.suggest_float("lr", 3e-5, 1e-2, log=True),
         "clip-coef": trial.suggest_float("clip_coef", 0.05, 0.50),
         "ent-coef": trial.suggest_float("ent_coef", 0.001, 0.03),
     }
