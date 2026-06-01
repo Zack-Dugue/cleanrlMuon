@@ -83,19 +83,28 @@ def trial_params(trial: optuna.Trial) -> dict:
     }
 
 
-def find_new_run_dir(runs_dir: Path, before: set[Path], started_at: float) -> Path:
-    after = set(p for p in runs_dir.glob("*") if p.is_dir())
-    candidates = list(after - before)
-    if not candidates:
-        # Fallback: use modification time if directory set was already visible.
-        candidates = [
-            p for p in after
-            if p.stat().st_mtime >= started_at - 2.0
-        ]
-    if not candidates:
-        raise RuntimeError("Could not identify the run directory created by the training script.")
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+def find_run_dir_by_prefix(runs_dir: Path, env_id: str, exp_name: str, seed: int, started_at: float) -> Path:
+    """Find the TensorBoard run directory created by this exact subprocess.
 
+    CleanRL creates run names as:
+        {env_id}__{exp_name}__{seed}__{timestamp}
+
+    Matching this prefix is much safer than taking the newest run directory when
+    many env/seed jobs are running in parallel.
+    """
+    prefix = f"{env_id}__{exp_name}__{seed}__"
+    candidates = [
+        p for p in runs_dir.glob(prefix + "*")
+        if p.is_dir() and p.stat().st_mtime >= started_at - 10.0
+    ]
+    if not candidates:
+        # Fallback without mtime gate, useful if filesystem mtimes are coarse.
+        candidates = [p for p in runs_dir.glob(prefix + "*") if p.is_dir()]
+    if not candidates:
+        raise RuntimeError(
+            f"Could not identify run directory with prefix {prefix!r} in {runs_dir.resolve()}"
+        )
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 def read_metric_from_tb(run_dir: Path, metric: str, window: int) -> float:
     ea = event_accumulator.EventAccumulator(str(run_dir))
@@ -128,7 +137,6 @@ def run_one(
 ) -> Tuple[str, int, float, float, str]:
     runs_dir = Path("runs")
     runs_dir.mkdir(exist_ok=True)
-    before = set(p for p in runs_dir.glob("*") if p.is_dir())
     started_at = time.time()
 
     env = os.environ.copy()
@@ -155,6 +163,8 @@ def run_one(
         f"--num-minibatches={args.num_minibatches}",
         f"--total-timesteps={args.total_timesteps}",
         f"--use-correlation-weighting={args.use_correlation_weighting}",
+        f"--correlation-scale-floor={args.correlation_scale_floor}",
+        f"--scale-value-clip-by-correlation={args.scale_value_clip_by_correlation}",
         f"--exp-name={exp_name}",
     ]
 
@@ -183,7 +193,7 @@ def run_one(
     if proc.returncode != 0:
         raise RuntimeError(f"Training failed for env={env_id}, seed={seed}, gpu={gpu}. See {log_path}")
 
-    run_dir = find_new_run_dir(runs_dir, before, started_at)
+    run_dir = find_run_dir_by_prefix(runs_dir, env_id, exp_name, seed, started_at)
     raw_score = read_metric_from_tb(run_dir, args.metric, args.metric_window)
     norm_score = normalize_score(env_id, raw_score)
 
@@ -208,6 +218,8 @@ def write_best_artifacts(args, study: optuna.Study, best: optuna.trial.FrozenTri
             "num_steps": args.num_steps,
             "num_minibatches": args.num_minibatches,
             "total_timesteps": args.total_timesteps,
+            "correlation_scale_floor": args.correlation_scale_floor,
+            "scale_value_clip_by_correlation": args.scale_value_clip_by_correlation,
             "seeds": args.seeds,
             "metric": args.metric,
             "metric_window": args.metric_window,
@@ -220,7 +232,9 @@ def write_best_artifacts(args, study: optuna.Study, best: optuna.trial.FrozenTri
             f"--clip-coef={best.params.get('clip_coef')} "
             f"--ent-coef={best.params.get('ent_coef')} "
             f"--update-epochs={args.update_epochs} "
-            f"--use-correlation-weighting={bool(args.use_correlation_weighting)}"
+            f"--use-correlation-weighting={bool(args.use_correlation_weighting)} "
+            f"--correlation-scale-floor={args.correlation_scale_floor} "
+            f"--scale-value-clip-by-correlation={bool(args.scale_value_clip_by_correlation)}"
         ),
         "all_trials": [
             {
@@ -255,7 +269,7 @@ def write_best_artifacts(args, study: optuna.Study, best: optuna.trial.FrozenTri
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--script", type=str, default="cleanrl/ppo_atari_envpool_corr_flag.py")
+    p.add_argument("--script", type=str, default="cleanrl/corr_scale_PPO_atari_envpool.py")
     p.add_argument("--metric", type=str, default="charts/episodic_return")
     p.add_argument("--metric-window", type=int, default=50)
     p.add_argument("--gpus", type=str, default="0")
@@ -273,6 +287,10 @@ def main() -> None:
     p.add_argument("--total-timesteps", type=int, default=5_000_000)
     p.add_argument("--momentum", type=float, default=None)
     p.add_argument("--aux-learning-rate", type=float, default=None)
+    p.add_argument("--correlation-scale-floor", type=float, default=0.01)
+    p.add_argument("--scale-value-clip-by-correlation", dest="scale_value_clip_by_correlation", action="store_true")
+    p.add_argument("--no-scale-value-clip-by-correlation", dest="scale_value_clip_by_correlation", action="store_false")
+    p.set_defaults(scale_value_clip_by_correlation=False)
 
     p.add_argument("--use-correlation-weighting", dest="use_correlation_weighting", action="store_true")
     p.add_argument("--no-use-correlation-weighting", dest="use_correlation_weighting", action="store_false")
@@ -308,13 +326,17 @@ def main() -> None:
         raw_results = []
         norm_scores = []
 
-        with ThreadPoolExecutor(max_workers=len(gpu_list)) as ex:
-            futures = []
-            for j, (env_id, seed) in enumerate(jobs):
-                gpu = gpu_list[j % len(gpu_list)]
-                futures.append(
-                    ex.submit(
-                        run_one,
+        # Build one sequential queue per GPU. This prevents two subprocesses from
+        # accidentally landing on the same physical GPU at the same time.
+        by_gpu = {gpu: [] for gpu in gpu_list}
+        for j, job in enumerate(jobs):
+            by_gpu[gpu_list[j % len(gpu_list)]].append(job)
+
+        def run_gpu_queue(gpu: int, gpu_jobs: list[tuple[str, int]]):
+            out = []
+            for env_id, seed in gpu_jobs:
+                out.append(
+                    run_one(
                         args=args,
                         gpu=gpu,
                         env_id=env_id,
@@ -323,23 +345,27 @@ def main() -> None:
                         trial_number=trial.number,
                     )
                 )
+            return out
+
+        with ThreadPoolExecutor(max_workers=len(gpu_list)) as ex:
+            futures = [ex.submit(run_gpu_queue, gpu, gpu_jobs) for gpu, gpu_jobs in by_gpu.items()]
 
             for fut in as_completed(futures):
-                env_id, seed, raw_score, norm_score, run_dir = fut.result()
-                raw_results.append(
-                    {
-                        "env_id": env_id,
-                        "seed": seed,
-                        "raw_score": raw_score,
-                        "normalized_score": norm_score,
-                        "run_dir": run_dir,
-                    }
-                )
-                norm_scores.append(norm_score)
-                print(
-                    f"[trial {trial.number}] env={env_id} seed={seed} "
-                    f"raw={raw_score:.4f} norm={norm_score:.4f}"
-                )
+                for env_id, seed, raw_score, norm_score, run_dir in fut.result():
+                    raw_results.append(
+                        {
+                            "env_id": env_id,
+                            "seed": seed,
+                            "raw_score": raw_score,
+                            "normalized_score": norm_score,
+                            "run_dir": run_dir,
+                        }
+                    )
+                    norm_scores.append(norm_score)
+                    print(
+                        f"[trial {trial.number}] env={env_id} seed={seed} "
+                        f"raw={raw_score:.4f} norm={norm_score:.4f}"
+                    )
 
         # Aggregate per seed first, then average seeds, matching the usual Atari multi-seed idea.
         seed_scores = []

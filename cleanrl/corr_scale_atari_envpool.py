@@ -769,7 +769,7 @@ if __name__ == "__main__":
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                     v_clipped = b_values[mb_inds] + torch.clamp(newvalue - b_values[mb_inds],
-                                                                -args.clip_coef*scale, args.clip_coef*scale)
+                                                                -args.clip_coef, args.clip_coef)
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
                 else:
