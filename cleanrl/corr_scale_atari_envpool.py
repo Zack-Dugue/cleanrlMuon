@@ -323,7 +323,7 @@ def _log_value_advantage_stats(
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     seed: int = 1
-    torch_deterministic: bool = True
+    torch_deterministic: bool = False
     cuda: bool = True
     track: bool = True
     wandb_project_name: str = "corr_ppo_project"
