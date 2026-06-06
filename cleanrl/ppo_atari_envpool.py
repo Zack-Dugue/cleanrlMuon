@@ -369,7 +369,7 @@ if __name__ == "__main__":
         device = torch.device(args.device)
     else:
         torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    torch.backends.cudnn.deterministic = False
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -427,7 +427,7 @@ if __name__ == "__main__":
 
     # -------- Optimizer selection (mirrors your PPO Atari code) --------
     device_type = device.type
-    aux_lr = args.aux_learning_rate if args.aux_learning_rate is not None else args.learning_rate / 300
+    aux_lr = args.aux_learning_rate if args.aux_learning_rate is not None else args.learning_rate
     if args.optimizer == "SGD":
         optimizer = optim.SGD(agent.parameters(), momentum=args.momentum, lr=args.learning_rate)
     elif args.optimizer == "Adam":
