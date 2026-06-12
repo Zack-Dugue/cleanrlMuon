@@ -487,6 +487,257 @@ class AdaMuonWithAuxAdam(torch.optim.Optimizer):
         if handle is not None:
             flush_prev()
 
+
+
+
+class RawAdaMuonWithAuxAdam(torch.optim.Optimizer):
+    """
+    Mixed optimizer:
+      - AdaMuon path for groups with use_muon=True
+      - AdamW-style path for groups with use_muon=False
+
+    Param group examples:
+        dict(params=[...2D+...], use_muon=True,  lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, eps=1e-8, weight_decay=0.01)
+        dict(params=[...bias/embeds...], use_muon=False, lr=3e-4, betas=(0.9,0.95), eps=1e-10, weight_decay=0.0)
+    """
+
+    def __init__(self, param_groups, *, rank: int | None = None, world_size: int | None = None):
+        # ---- Change 1: auto-detect distributed, default to single-GPU ----
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank() if rank is None else int(rank)
+            self.world_size = dist.get_world_size() if world_size is None else int(world_size)
+            self._dist_ready = True
+        else:
+            self.rank = 0 if rank is None else int(rank)
+            self.world_size = 1 if world_size is None else int(world_size)
+            self._dist_ready = False
+
+        expanded_groups = []
+        for group in param_groups:
+            assert "use_muon" in group, "Each param_group must include use_muon=True/False"
+            params = list(group["params"])
+            if not params:
+                continue
+
+            if group["use_muon"]:
+                # AdaMuon defaults
+                lr = group.get("lr", 0.02)
+                momentum = group.get("momentum", 0.95)
+                weight_decay = group.get("weight_decay", 0.01)
+                nesterov = group.get("nesterov", True)
+                ns_steps = group.get("ns_steps", 5)
+                eps = group.get("eps", 1e-8)
+
+                # Group by numel for fused buffers (only used if distributed)
+                unique_sizes = {p.numel() for p in params}
+                for size in unique_sizes:
+                    p_list = [p for p in params if p.numel() == size]
+                    device = p_list[0].device
+                    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+                    buf = torch.empty(self.world_size, size, dtype=dtype, device=device)  # harmless if ws==1
+
+                    expanded_groups.append(dict(
+                        params=p_list,
+                        use_muon=True,
+                        lr=lr, weight_decay=weight_decay,
+                        momentum=momentum,
+                        nesterov=nesterov,
+                        ns_steps=ns_steps, eps=eps,
+                        update_buffer=buf,
+                        update_buffer_views=[buf[i] for i in range(self.world_size)],
+                    ))
+            else:
+                # Aux AdamW defaults
+                lr = group.get("lr", 3e-4)
+                betas = group.get("betas", (0.9, 0.95))
+                eps = group.get("eps", 1e-10)
+                weight_decay = group.get("weight_decay", 0.0)
+
+                expanded_groups.append(dict(
+                    params=params,
+                    use_muon=False,
+                    lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                ))
+
+        super().__init__(expanded_groups, {})
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                self._step_adamuon_group(group)
+            else:
+                self._step_aux_adam_group(group)
+        return loss
+
+    @torch.no_grad()
+    def _step_aux_adam_group(self, group: dict):
+        # AdamW-style (bias-corrected)
+        lr = group["lr"]
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+        wd = group["weight_decay"]
+
+        for p in group["params"]:
+            g = p.grad
+            if g is None:
+                continue
+
+            if wd != 0:
+                p.mul_(1 - lr * wd)
+
+            st = self.state[p]
+            if len(st) == 0:
+                st["exp_avg"] = torch.zeros_like(p)
+                st["exp_avg_sq"] = torch.zeros_like(p)
+                st["step"] = 0
+            st["step"] += 1
+            t = st["step"]
+
+            m = st["exp_avg"]; v = st["exp_avg_sq"]
+            m.mul_(beta1).add_(g, alpha=1 - beta1)
+            v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+
+            bc1 = 1 - beta1 ** t
+            bc2 = 1 - beta2 ** t
+            denom = (v.sqrt() / (bc2 ** 0.5)).add_(eps)
+            step_dir = (m / bc1) / denom
+            p.add_(step_dir, alpha=-lr)
+
+    @torch.no_grad()
+    def _step_adamuon_group(self, group: dict):
+        """
+        AdaMuon path:
+          momentum (+ optional Nesterov)
+          -> zeropower on sign(g) in 2D matrix form
+          -> per-param variance buffer v
+          -> normalize by sqrt(v)+eps
+          -> heuristic scaling
+          -> decoupled WD
+          -> param update
+
+        Dist path uses all_gather; single-process path bypasses collectives.
+        """
+        lr = group["lr"]
+        wd = group["weight_decay"]
+        momentum = group["momentum"]
+        nesterov = group["nesterov"]
+        ns_steps = group["ns_steps"]
+        eps = group["eps"]
+
+        params = group["params"]
+
+        def make_2d(x: Tensor) -> Tensor:
+            # Muon/Newton-Schulz wants matrices.
+            # Linear: [out, in] stays [out, in]
+            # Conv: [out, in, kh, kw] -> [out, in*kh*kw]
+            # 1D params should normally not be routed to Muon, but this keeps it safe.
+            if x.ndim >= 2:
+                return x.reshape(x.shape[0], -1)
+            return x.reshape(1, -1)
+
+        def compute_adamuon_update(p: Tensor, g: Tensor) -> Tensor:
+            st = self.state[p]
+
+            if "momentum_buffer" not in st:
+                st["momentum_buffer"] = torch.zeros_like(g)
+
+            buf: Tensor = st["momentum_buffer"]
+            buf.mul_(momentum).add_(g)
+
+            if nesterov:
+                g_mom = g.add(buf, alpha=momentum)
+            else:
+                g_mom = buf
+
+            g_flat = make_2d(g_mom)
+            v: Tensor = st["v_buffer"]
+
+            # Correct torch addcmul_ signature:
+            #   v = momentum * v + (1 - momentum) * z * z
+            v.mul_(momentum).addcmul_(g_flat, g_flat, value=1 - momentum)
+
+            # This preserves your AdaMuon-ish "sign before zeropower" behavior.
+            z = zeropower_via_newtonschulz5(torch.sign(g_flat), steps=ns_steps)
+
+            if ("v_buffer" not in st) or (st["v_buffer"].shape != z.shape):
+                st["v_buffer"] = torch.zeros_like(z)
+
+
+
+            z = z / (v.sqrt().add(eps))
+
+            # Heuristic normalization. Uses the actual 2D matrix shape after flattening.
+            rows, cols = z.shape
+            scale = 0.2 * ((rows * cols) ** 0.5) / (z.norm() + eps)
+            z.mul_(scale)
+
+            return z.reshape_as(p)
+
+        # ---- Single-process fast path ----
+        if (not self._dist_ready) or self.world_size == 1:
+            for p in params:
+                g = p.grad
+                if g is None:
+                    continue
+
+                z = compute_adamuon_update(p, g)
+
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+
+                p.add_(z, alpha=-lr)
+
+            return
+
+        # ---- Distributed path ----
+        update_buffer: Tensor = group["update_buffer"]
+        update_buffer_views: list[Tensor] = group["update_buffer_views"]
+
+        handle = None
+        params_world = None
+
+        def flush_prev():
+            handle.wait()
+
+            for p_world, z_world in zip(params_world, update_buffer_views):
+                if p_world.grad is None:
+                    continue
+
+                if wd != 0:
+                    p_world.mul_(1 - lr * wd)
+
+                p_world.add_(z_world.view_as(p_world), alpha=-lr)
+
+        for base_i in range(0, len(params), self.world_size):
+            local_i = base_i + self.rank
+
+            if local_i < len(params):
+                p = params[local_i]
+                g = p.grad
+
+                if g is None:
+                    z = torch.zeros_like(update_buffer_views[self.rank])
+                else:
+                    z = compute_adamuon_update(p, g)
+                    z = z.to(update_buffer.dtype).reshape(-1)
+            else:
+                z = torch.zeros_like(update_buffer_views[self.rank])
+
+            if base_i > 0:
+                flush_prev()
+
+            handle = dist.all_gather_into_tensor(update_buffer, z, async_op=True)
+            params_world = params[base_i: base_i + self.world_size]
+
+        if handle is not None:
+            flush_prev()
+
 # ==============================
 # MuonWithAuxAdam (normalized Muon + aux AdamW)
 # ==============================
@@ -1087,6 +1338,44 @@ def normuon_update(
     return O_hat, O
 
 
+def rawnormuon_update(
+    grad_2d: Tensor,
+    momentum: Tensor,
+    v_buffer: Tensor,
+    beta: float = 0.95,
+    beta2: float = 0.95,
+    ns_steps: int = 5,
+    eps: float = 1e-10,
+) -> Tuple[Tensor, Tensor]:
+    """
+    NorMuon-style update on a *2D view* of a weight matrix.
+
+    Shapes:
+      grad_2d      : (m, n_flat)
+      momentum     : (m, n_flat)  -- EMA of gradients
+      v_buffer     : (m, 1)       -- row-wise second moment
+
+    Returns:
+      O_hat : (m, n_flat)  -- row-normalized orthogonal update
+      O     : (m, n_flat)  -- pre-normalization orthogonal matrix
+    """
+    # 1) First-order momentum
+    momentum.lerp_(grad_2d, 1.0 - beta)
+    M = momentum  # effective direction
+    row_mean_sq = (grad_2d * grad_2d).mean(dim=1, keepdim=True)  # (m, 1)
+    v_buffer.lerp_(row_mean_sq, 1.0 - beta2)
+    # 2) Orthogonalize via Muon NS iteration
+    O = zeropower_via_newtonschulz5(M, steps=ns_steps).to(dtype=grad_2d.dtype)
+
+    # 3) Row-wise second moment: v_t in R^{m x 1}
+
+
+    # 4) Row-wise normalization
+    O_hat = O / (v_buffer.sqrt() + eps)  # (m, n_flat)
+
+    return O_hat, O
+
+
 # =======================================================
 #  Aux Adam update
 # =======================================================
@@ -1236,6 +1525,180 @@ class SingleDeviceNorMuonWithAuxAdam(Optimizer):
             v_buf: Tensor = st["v_buffer"]
 
             O_hat, _ = normuon_update(
+                grad_2d,
+                mom,
+                v_buf,
+                beta=beta,
+                beta2=beta2,
+                ns_steps=5,
+                eps=1e-10,
+            )
+
+            # Global RMS-matching scale
+            fro_norm = O_hat.norm() + 1e-10
+            eta_hat = 0.2 * lr * math.sqrt(m * n_flat) / fro_norm
+
+            # Decoupled weight decay
+            if wd != 0.0:
+                W_2d.mul_(1.0 - lr * wd)
+
+            # Apply update
+            W_2d.add_(O_hat, alpha=-eta_hat)
+
+            # Write back if conv
+            if p.ndim == 4:
+                p.copy_(W_2d.view_as(p))
+
+    @torch.no_grad()
+    def _step_aux_adam_group(self, group: Dict[str, Any]) -> None:
+        lr: float = group["lr"]
+        betas: Tuple[float, float] = group["betas"]
+        eps: float = group["eps"]
+        wd: float = group["weight_decay"]
+
+        for p in group["params"]:
+            g = p.grad
+            if g is None:
+                continue
+
+            st = self.state[p]
+            if len(st) == 0:
+                st["exp_avg"] = torch.zeros_like(p)
+                st["exp_avg_sq"] = torch.zeros_like(p)
+                st["step"] = 0
+
+            st["step"] += 1
+            step_num = st["step"]
+            exp_avg: Tensor = st["exp_avg"]
+            exp_avg_sq: Tensor = st["exp_avg_sq"]
+
+            upd = adam_update(g, exp_avg, exp_avg_sq, step_num, betas, eps)
+
+            if wd != 0.0:
+                p.mul_(1.0 - lr * wd)
+
+            p.add_(upd, alpha=-lr)
+
+class RawNorMuonWithAuxAdam(Optimizer):
+    """
+    Non-distributed NorMuon + aux Adam optimizer.
+
+    Usage pattern:
+        hidden_params = []
+        aux_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2 and not name.endswith(".bias"):
+                hidden_params.append(p)   # NorMuon
+            else:
+                aux_params.append(p)      # Adam
+
+        optimizer = SingleDeviceNorMuonWithAuxAdam([
+            dict(params=hidden_params, use_muon=True,  lr=0.02,
+                 momentum=0.95, beta2=0.95, weight_decay=0.0005),
+            dict(params=aux_params,    use_muon=False, lr=3e-4,
+                 betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0),
+        ])
+    """
+
+    def __init__(self, param_groups: List[Dict[str, Any]]):
+        processed_groups: List[Dict[str, Any]] = []
+
+        for group in param_groups:
+            if "use_muon" not in group:
+                raise ValueError("Each param_group must include 'use_muon': True/False")
+
+            params = list(group["params"])
+            if len(params) == 0:
+                continue
+
+            if group["use_muon"]:
+                lr = group.get("lr", 0.02)
+                momentum = group.get("momentum", 0.95)
+                beta2 = group.get("beta2", 0.95)
+                weight_decay = group.get("weight_decay", 0.0)
+
+                new_group = dict(
+                    params=params,
+                    use_muon=True,
+                    lr=lr,
+                    momentum=momentum,
+                    beta2=beta2,
+                    weight_decay=weight_decay,
+                )
+                processed_groups.append(new_group)
+            else:
+                lr = group.get("lr", 3e-4)
+                betas = group.get("betas", (0.9, 0.95))
+                eps = group.get("eps", 1e-10)
+                weight_decay = group.get("weight_decay", 0.0)
+
+                new_group = dict(
+                    params=params,
+                    use_muon=False,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=weight_decay,
+                )
+                processed_groups.append(new_group)
+
+        super().__init__(processed_groups, {})
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                self._step_nor_muon_group(group)
+            else:
+                self._step_aux_adam_group(group)
+
+        return loss
+
+    @torch.no_grad()
+    def _step_nor_muon_group(self, group: Dict[str, Any]) -> None:
+        lr: float = group["lr"]
+        beta: float = group["momentum"]
+        beta2: float = group["beta2"]
+        wd: float = group["weight_decay"]
+
+        for p in group["params"]:
+            g = p.grad
+            if g is None:
+                continue
+
+            # Use 2D view for linear/conv weights
+            if p.ndim == 2:
+                m, n_flat = p.shape
+                grad_2d = g
+                W_2d = p
+            elif p.ndim == 4:
+                # Conv weights: (out_channels, in_channels, kH, kW)
+                m = p.size(0)
+                n_flat = p[0].numel()
+                grad_2d = g.view(m, n_flat)
+                W_2d = p.view(m, n_flat)
+            else:
+                # 1D / others: skip here; should be in aux Adam group
+                continue
+
+            st = self.state[p]
+            if len(st) == 0:
+                st["momentum_buffer"] = torch.zeros_like(grad_2d)
+                st["v_buffer"] = torch.zeros(
+                    m, 1, device=p.device, dtype=p.dtype
+                )
+
+            mom: Tensor = st["momentum_buffer"]
+            v_buf: Tensor = st["v_buffer"]
+
+            O_hat, _ = rawnormuon_update(
                 grad_2d,
                 mom,
                 v_buf,
