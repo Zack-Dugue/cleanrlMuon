@@ -656,7 +656,7 @@ class RawAdaMuonWithAuxAdam(torch.optim.Optimizer):
                 g_mom = buf
 
             g_flat = make_2d(g_mom)
-            if ("v_buffer" not in st) or (st["v_buffer"].shape != z.shape):
+            if ("v_buffer" not in st) or (st["v_buffer"].shape != g_flat.shape):
                 st["v_buffer"] = torch.zeros_like(g_flat)
             v: Tensor = st["v_buffer"]
 
