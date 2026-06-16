@@ -662,7 +662,7 @@ class RawAdaMuonWithAuxAdam(torch.optim.Optimizer):
 
             # Correct torch addcmul_ signature:
             #   v = momentum * v + (1 - momentum) * z * z
-            v.mul_(momentum).addcmul_(g_flat, g_flat, value=1 - momentum)
+            v.mul_(momentum).addcmul_(g_flat, g_flat, value=1 - momentum**(.5))
 
             # This preserves your AdaMuon-ish "sign before zeropower" behavior.
             z = zeropower_via_newtonschulz5(torch.sign(g_flat), steps=ns_steps)
@@ -1364,7 +1364,7 @@ def rawnormuon_update(
     momentum.lerp_(grad_2d, 1.0 - beta)
     M = momentum  # effective direction
     row_mean_sq = (grad_2d * grad_2d).mean(dim=1, keepdim=True)  # (m, 1)
-    v_buffer.lerp_(row_mean_sq, 1.0 - beta2)
+    v_buffer.lerp_(row_mean_sq, 1.0 - beta2**.5)
     # 2) Orthogonalize via Muon NS iteration
     O = zeropower_via_newtonschulz5(M, steps=ns_steps).to(dtype=grad_2d.dtype)
 
