@@ -251,8 +251,10 @@ class AdaMuonWithAuxAdam(torch.optim.Optimizer):
         dict(params=[...bias/embeds...], use_muon=False, lr=3e-4, betas=(0.9,0.95), eps=1e-10, weight_decay=0.0)
     """
 
-    def __init__(self, param_groups, *, rank: int | None = None, world_size: int | None = None):
+    def __init__(self, param_groups, *, rank: int | None = None, world_size: int | None = None, normed = True):
         # ---- Change 1: auto-detect distributed, default to single-GPU ----
+        self.normed = normed
+
         if dist.is_available() and dist.is_initialized():
             self.rank = dist.get_rank() if rank is None else int(rank)
             self.world_size = dist.get_world_size() if world_size is None else int(world_size)
@@ -423,7 +425,10 @@ class AdaMuonWithAuxAdam(torch.optim.Optimizer):
 
             # Heuristic normalization. Uses the actual 2D matrix shape after flattening.
             rows, cols = z.shape
-            scale = 0.2 * ((rows * cols) ** 0.5) / (z.norm() + eps)
+            if self.normed:
+             scale = 0.2 * ((rows * cols) ** 0.5) / (z.norm() + eps)
+            else:
+                scale =  0.2 * ((rows * cols) ** 0.5)
             z.mul_(scale)
 
             return z.reshape_as(p)
@@ -662,7 +667,7 @@ class RawAdaMuonWithAuxAdam(torch.optim.Optimizer):
 
             # Correct torch addcmul_ signature:
             #   v = momentum * v + (1 - momentum) * z * z
-            v.mul_(momentum).addcmul_(g_flat, g_flat, value=1 - momentum**(.5))
+            v.mul_(momentum**.5).addcmul_(g_flat, g_flat, value=1 - momentum**(.5))
 
             # This preserves your AdaMuon-ish "sign before zeropower" behavior.
             z = zeropower_via_newtonschulz5(torch.sign(g_flat), steps=ns_steps)
@@ -1429,9 +1434,9 @@ class SingleDeviceNorMuonWithAuxAdam(Optimizer):
         ])
     """
 
-    def __init__(self, param_groups: List[Dict[str, Any]]):
+    def __init__(self, param_groups: List[Dict[str, Any]], normed = True):
         processed_groups: List[Dict[str, Any]] = []
-
+        self.normed = normed
         for group in param_groups:
             if "use_muon" not in group:
                 raise ValueError("Each param_group must include 'use_muon': True/False")
@@ -1537,7 +1542,12 @@ class SingleDeviceNorMuonWithAuxAdam(Optimizer):
 
             # Global RMS-matching scale
             fro_norm = O_hat.norm() + 1e-10
-            eta_hat = 0.2 * lr * math.sqrt(m * n_flat) / fro_norm
+
+            if self.normed:
+             eta_hat = 0.2 * lr * math.sqrt(m * n_flat) / fro_norm
+            else:
+                eta_hat = .2 * lr * math.sqrt(m*n_flat)
+
 
             # Decoupled weight decay
             if wd != 0.0:

@@ -460,6 +460,13 @@ if __name__ == "__main__":
             dict(params=aux_params, lr=aux_lr, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
+    elif args.optimizer == "NorMuon_NoNorm":
+        muon_params, aux_params = agent.get_split_params()
+        param_groups = [
+            dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
+            dict(params=aux_params, lr=aux_lr, weight_decay=1e-4, use_muon=False),
+        ]
+        optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups,normed=False)
     elif args.optimizer == "RawNorMuon":
         muon_params, aux_params = agent.get_split_params()
         param_groups = [
@@ -475,6 +482,13 @@ if __name__ == "__main__":
             dict(params=aux_params, lr=aux_lr, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = AdaMuonWithAuxAdam(param_groups)
+    elif args.optimizer == "AdaMuon_NoNorm":
+        muon_params, aux_params = agent.get_split_params()
+        param_groups = [
+            dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
+            dict(params=aux_params, lr=aux_lr, weight_decay=1e-4, use_muon=False),
+        ]
+        optimizer = AdaMuonWithAuxAdam(param_groups, normed=False)
     elif args.optimizer == "RawAdaMuon":
         muon_params, aux_params = agent.get_split_params()
         param_groups = [
