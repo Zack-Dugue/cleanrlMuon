@@ -16,7 +16,7 @@ import tyro
 from torch.utils.tensorboard import SummaryWriter
 
 from optimizers import AdaMuonWithAuxAdam, MuonWithAuxAdam, BGD, SingleDeviceNorMuonWithAuxAdam
-from models import BetterPQNQNetwork
+from models import PQNAtariNetwork
 
 
 @dataclass
@@ -73,10 +73,10 @@ class Args:
 
     # optimizer parity with your PPO script
     optimizer: str = "Adam"  # ["SGD", "Adam", "Muon", "NorMuon", "AdaMuon", "BGD"]
-    momentum: float = 0.9
+    momentum: float = 0.95
 
     # model optimizer-routing kwargs
-    use_muon_input: bool = False
+    use_muon_input: bool = True
     use_muon_output: bool = False
 
     # to be filled in runtime
@@ -136,17 +136,17 @@ if __name__ == "__main__":
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    if True:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            save_code=True,
-        )
+    # if True:
+    #     import wandb
+    #     wandb.login(key="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")
+    #     wandb.init(
+    #         project=args.wandb_project_name,
+    #         entity=args.wandb_entity,
+    #         sync_tensorboard=True,
+    #         config=vars(args),
+    #         name=run_name,
+    #         save_code=True,
+    #     )
 
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -164,7 +164,6 @@ if __name__ == "__main__":
         device = torch.device(args.device)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-
     # env setup
     envs = envpool.make(
         args.env_id,
@@ -181,7 +180,7 @@ if __name__ == "__main__":
     print(f"envs.action_space type = {type(envs.action_space)}")
     assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    q_network = BetterPQNQNetwork(
+    q_network = PQNAtariNetwork(
         envs,
         use_muon_input=args.use_muon_input,
         use_muon_output=args.use_muon_output,
@@ -199,7 +198,7 @@ if __name__ == "__main__":
     elif args.optimizer == "Adam":
         optimizer = optim.Adam(
             q_network.parameters(),
-            betas=(args.momentum, 0.999),
+            betas=(args.momentum, 0.99),
             lr=args.learning_rate,
             eps=1e-5,
         )
@@ -217,7 +216,7 @@ if __name__ == "__main__":
             ),
             dict(
                 params=aux_params,
-                lr=args.learning_rate / 300,
+                lr=args.learning_rate ,
                 momentum=args.momentum,
                 weight_decay=1e-4,
                 use_muon=False,
@@ -228,14 +227,14 @@ if __name__ == "__main__":
         muon_params, aux_params = q_network.get_split_params()
         param_groups = [
             dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
-            dict(params=aux_params, lr=args.learning_rate / 300, weight_decay=1e-4, use_muon=False),
+            dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
     elif args.optimizer == "AdaMuon":
         muon_params, aux_params = q_network.get_split_params()
         param_groups = [
             dict(params=muon_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=True),
-            dict(params=aux_params, lr=args.learning_rate / 300, weight_decay=1e-4, use_muon=False),
+            dict(params=aux_params, lr=args.learning_rate, weight_decay=1e-4, use_muon=False),
         ]
         optimizer = AdaMuonWithAuxAdam(param_groups)
     elif args.optimizer == "BGD":

@@ -608,125 +608,229 @@ class ConvSimpleAgent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), value
 
 
-class BetterPQNQNetwork(nn.Module):
+import math
+from typing import Literal, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+NormType = Literal["layer_norm", "batch_norm", "none"]
+
+
+class ChannelLayerNorm2d(nn.Module):
     """
-    PQN-style Q-network with:
-      - optional input BatchRenorm1d over the channel dimension
-      - GELU activations
-      - two-layer feedforward head
-      - Muon parameter splitting
+    Flax nn.LayerNorm() on NHWC conv activations normalizes over the last dim,
+    i.e. channels at each spatial location.
 
-    Muon routing:
-      - default Muon params:
-          conv2.weight
-          conv3.weight
-          fc1.weight
-          fc2.weight
-      - optional:
-          conv1.weight   if use_muon_input=True
-          fc_out.weight  if use_muon_output=True
+    PyTorch Conv2d uses NCHW, so this module applies LayerNorm over C by
+    temporarily moving channels to the last dimension.
+    """
 
-      All norm params / biases remain on the Adam-side.
+    def __init__(self, num_channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # NCHW -> NHWC
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        # NHWC -> NCHW
+        return x.permute(0, 3, 1, 2)
+
+
+def make_conv_norm(norm_type: NormType, channels: int) -> nn.Module:
+    if norm_type == "layer_norm":
+        return ChannelLayerNorm2d(channels)
+    if norm_type == "batch_norm":
+        return nn.BatchNorm2d(channels)
+    if norm_type == "none":
+        return nn.Identity()
+    raise ValueError(f"Unknown norm_type: {norm_type}")
+
+
+def make_linear_norm(norm_type: NormType, features: int) -> nn.Module:
+    if norm_type == "layer_norm":
+        return nn.LayerNorm(features)
+    if norm_type == "batch_norm":
+        return nn.BatchNorm1d(features)
+    if norm_type == "none":
+        return nn.Identity()
+    raise ValueError(f"Unknown norm_type: {norm_type}")
+
+
+def init_he_normal(module: nn.Module) -> None:
+    """
+    Rough PyTorch equivalent of Flax he_normal for conv/dense layers.
+    """
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def init_lecun_normal_linear(layer: nn.Linear) -> None:
+    """
+    Flax Dense default is closer to LeCun normal than He normal.
+    The PureJaxQL implementation uses he_normal for the trunk, but leaves
+    the final Q head at the Flax Dense default.
+    """
+    fan_in = layer.weight.shape[1]
+    std = 1.0 / math.sqrt(fan_in)
+    nn.init.normal_(layer.weight, mean=0.0, std=std)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
+class PQNAtariNetwork(nn.Module):
+    """
+    PyTorch implementation similar to purejaxql/pqn_atari.py.
+
+    Expected input:
+        obs: uint8 or float tensor of shape (B, C, H, W), usually (B, 4, 84, 84)
+
+    Output:
+        q_values: tensor of shape (B, num_actions)
     """
 
     def __init__(
         self,
-        env,
-        *,
-        use_muon_input: bool = False,
-        use_muon_output: bool = False,
-        brn_eps: float = 1e-5,
-        brn_momentum: float = 0.01,
-        brn_max_r: float = 3.0,
-        brn_max_d: float = 5.0,
-        brn_warmup_steps: int = 10000,
-        brn_smooth: bool = True,
+        envs,
+        norm_type: NormType = "layer_norm",
+        norm_input: bool = False,
+        use_muon_input = True,
+        use_muon_output = False,
     ):
         super().__init__()
+        obs_shape = envs.single_observation_space.shape
+        action_dim = envs.single_action_space.n
+        c, h, w = obs_shape
 
+        self.num_actions = action_dim
+        self.norm_type = norm_type
+        self.norm_input = norm_input
         self.use_muon_input = use_muon_input
         self.use_muon_output = use_muon_output
-        action_dim = env.single_action_space.n
+        # PureJaxQL optionally uses BatchNorm on the input before /255.
+        # For PyTorch, this is BatchNorm2d over the stacked-frame channels.
+        self.input_norm = nn.BatchNorm2d(c) if norm_input else nn.Identity()
 
-        # Input normalization over channels for Atari stacked frames: [B, 4, H, W]
-        self.input_brn = BatchRenorm1d(
-            4,
-            eps=brn_eps,
-            momentum=brn_momentum,
-            max_r=brn_max_r,
-            max_d=brn_max_d,
-            warmup_steps=brn_warmup_steps,
-            smooth=brn_smooth,
-        )
+        self.conv1 = nn.Conv2d(c, 32, kernel_size=8, stride=4, padding=0)
+        self.norm1 = make_conv_norm(norm_type, 32)
 
-        self.conv1 = layer_init(nn.Conv2d(4, 32, 8, stride=4))
-        self.ln1 = nn.LayerNorm([32, 20, 20])
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0)
+        self.norm2 = make_conv_norm(norm_type, 64)
 
-        self.conv2 = layer_init(nn.Conv2d(32, 64, 4, stride=2))
-        self.ln2 = nn.LayerNorm([64, 9, 9])
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0)
+        self.norm3 = make_conv_norm(norm_type, 64)
 
-        self.conv3 = layer_init(nn.Conv2d(64, 64, 3, stride=1))
-        self.ln3 = nn.LayerNorm([64, 7, 7])
+        # For standard Atari 84x84 input:
+        # 84 -> conv8/s4 -> 20
+        # 20 -> conv4/s2 -> 9
+        # 9  -> conv3/s1 -> 7
+        # flatten = 64 * 7 * 7 = 3136
+        self.fc = nn.Linear(64 * 7 * 7, 512)
+        self.fc_norm = make_linear_norm(norm_type, 512)
 
-        self.flatten = nn.Flatten()
+        self.q_head = nn.Linear(512, action_dim)
 
-        self.fc1 = layer_init(nn.Linear(3136, 512))
-        self.ln4 = nn.LayerNorm(512)
+        self.apply(init_he_normal)
+        init_lecun_normal_linear(self.q_head)
 
-        self.fc2 = layer_init(nn.Linear(512, 512))
-        self.ln5 = nn.LayerNorm(512)
+    def features(self, obs: torch.Tensor) -> torch.Tensor:
+        # EnvPool/CleanRL Atari obs usually arrives as uint8 NCHW.
+        x = obs
 
-        self.fc_out = layer_init(nn.Linear(512, action_dim))
-        self.act = nn.GELU()
+        if x.dtype != torch.float32:
+            x = x.float()
 
-    def forward(self, x):
+        # Match PureJaxQL ordering: optional input norm, then scale by 255.
+        x = self.input_norm(x)
         x = x / 255.0
-        # x = self.input_brn(x)
 
-        x = self.conv1(x)
-        x = self.ln1(x)
-        x = self.act(x)
+        x = F.relu(self.norm1(self.conv1(x)))
+        x = F.relu(self.norm2(self.conv2(x)))
+        x = F.relu(self.norm3(self.conv3(x)))
 
-        x = self.conv2(x)
-        x = self.ln2(x)
-        x = self.act(x)
-
-        x = self.conv3(x)
-        x = self.ln3(x)
-        x = self.act(x)
-
-        x = self.flatten(x)
-
-        x = self.fc1(x)
-        x = self.ln4(x)
-        x = self.act(x)
-
-        x = self.fc2(x)
-        x = self.ln5(x)
-        x = self.act(x)
-
-        x = self.fc_out(x)
+        x = torch.flatten(x, start_dim=1)
+        x = F.relu(self.fc_norm(self.fc(x)))
         return x
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = self.features(obs)
+        return self.q_head(x)
+
+    @torch.no_grad()
+    def greedy_action(self, obs: torch.Tensor) -> torch.Tensor:
+        q_values = self(obs)
+        return torch.argmax(q_values, dim=-1)
+
+    @torch.no_grad()
+    def epsilon_greedy_action(self, obs: torch.Tensor, epsilon: float) -> torch.Tensor:
+        q_values = self(obs)
+        greedy = torch.argmax(q_values, dim=-1)
+        random_actions = torch.randint(
+            low=0,
+            high=self.num_actions,
+            size=greedy.shape,
+            device=obs.device,
+        )
+        explore = torch.rand(greedy.shape, device=obs.device) < epsilon
+        return torch.where(explore, random_actions, greedy)
+
 
     def get_split_params(self):
         """
         Returns:
             muon_params, adam_params
+
+        Default:
+          Muon:
+            trunk_fc.weight
+
+          Adam:
+            input_brn params
+            conv weights unless use_muon_input=True
+            output heads unless use_muon_output=True
+            all biases
+            all LayerNorm params
+
+        Optional:
+          use_muon_input=True:
+            conv1.weight
+            conv2.weight
+            conv3.weight
+
+          use_muon_output=True:
+            actor_out.weight
+            critic_out.weight
         """
+
         muon_params = [
-            self.conv2.weight,
-            self.conv3.weight,
-            self.fc1.weight,
-            self.fc2.weight,
+            self.actor_fc.weight,
+            self.critic_fc.weight,
+            self.trunk_fc.weight,
         ]
 
         if self.use_muon_input:
-            muon_params.append(self.conv1.weight)
+            muon_params.extend([
+                # self.conv1.weight,
+                self.conv2.weight,
+                self.conv3.weight,
+            ])
 
         if self.use_muon_output:
-            muon_params.append(self.fc_out.weight)
+            muon_params.extend([
+                self.actor_out.weight,
+                self.critic_out.weight,
+            ])
 
         muon_ids = {id(p) for p in muon_params}
-        adam_params = [p for p in self.parameters() if id(p) not in muon_ids]
+
+        adam_params = [
+            p for p in self.parameters()
+            if id(p) not in muon_ids
+        ]
 
         return muon_params, adam_params

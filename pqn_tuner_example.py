@@ -52,12 +52,19 @@ def default_params_fn(
         else:
             learning_rate = trial.suggest_float("lr", 3e-5, 3e-3, log=True)
 
+        distance_from_one = trial.suggest_float("distance_from_one", 1e-3, 1.0, log=True)
+
+        # 2. Invert it to get the actual lambda value
+        lambda_val = 1.0 - distance_from_one
+
+        # 3. (Optional) Clip or round to keep it perfectly within [0.0, 1.0]
+        lambda_val = max(0.0, min(lambda_val, 1.0))
+
         params = {
             # Tunables
             "learning-rate": learning_rate,
-            "momentum": trial.suggest_float("momentum", 0.9, 0.99),
             "exploration-fraction": trial.suggest_float("exploration_fraction", 0.03, 0.20),
-            "q-lambda": trial.suggest_float("q_lambda", 0.45, 0.85),
+            "q-lambda": lambda_val,
 
             # Fixed batch shape / run length
             "num-envs": 32,
