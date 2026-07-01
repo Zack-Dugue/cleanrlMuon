@@ -339,6 +339,7 @@ class Args:
     # Optimizer parity with your PPO Atari script
     optimizer: str = "Adam"  # ["SGD", "Adam", "Muon", "AdaMuon"]
     momentum: float = 0.9
+    #IGNORE THIS AUX LEARNING RATE THING
     aux_learning_rate: float | None = None
     """optional aux Adam LR for Muon-style optimizers; defaults to learning_rate / 300"""
 
