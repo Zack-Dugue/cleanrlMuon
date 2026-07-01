@@ -30,6 +30,8 @@ class Args:
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
     track: bool = True
+    """wandb tag"""
+    wandb_tag: str = None
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
@@ -136,17 +138,18 @@ if __name__ == "__main__":
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    # if True:
-    #     import wandb
-    #     wandb.login(key="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")
-    #     wandb.init(
-    #         project=args.wandb_project_name,
-    #         entity=args.wandb_entity,
-    #         sync_tensorboard=True,
-    #         config=vars(args),
-    #         name=run_name,
-    #         save_code=True,
-    #     )
+    if True:
+        import wandb
+        wandb.login(key="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")
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            tags=[args.wandb_tag] if args.wandb_tag else None,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            save_code=True,
+        )
 
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
