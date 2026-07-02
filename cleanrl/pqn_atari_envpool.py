@@ -140,7 +140,6 @@ if __name__ == "__main__":
 
     if True:
         import wandb
-        wandb.login(key="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")
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
