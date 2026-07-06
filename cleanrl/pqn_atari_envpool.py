@@ -43,22 +43,21 @@ class Args:
     # optional multi-gpu launcher compatibility
     device: str = None
 
-    # Algorithm specific arguments
     env_id: str = "Breakout-v5"
     """the id of the environment"""
     total_timesteps: int = 10_000_000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 8
+    num_envs: int = 128
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 8
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    num_minibatches: int = 1
+    num_minibatches: int = 4
     """the number of mini-batches"""
     update_epochs: int = 4
     """the K epochs to update the Q-network"""
@@ -68,7 +67,7 @@ class Args:
     """the starting epsilon for exploration"""
     end_e: float = 0.01
     """the ending epsilon for exploration"""
-    exploration_fraction: float = 0.10
+    exploration_fraction: float = 0.001
     """the fraction of `total_timesteps` it takes from start_e to end_e"""
     q_lambda: float = 0.65
     """the lambda for the Q-Learning algorithm"""

@@ -67,9 +67,9 @@ def default_params_fn(
             "q-lambda": lambda_val,
 
             # Fixed batch shape / run length
-            "num-envs": 32,
-            "num-steps": 256,               # total batch: 8192
-            "total-timesteps": 5_000_000,
+            "num-envs": 256,
+            "num-steps": 32,               # total batch: 8192
+            "total-timesteps": 10_000_000,
 
             # Fixed (not tuned)
             "optimizer": optimizer_name,

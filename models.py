@@ -779,51 +779,58 @@ class PQNAtariNetwork(nn.Module):
         explore = torch.rand(greedy.shape, device=obs.device) < epsilon
         return torch.where(explore, random_actions, greedy)
 
-
     def get_split_params(self):
         """
         Returns:
             muon_params, adam_params
 
-        Default:
-          Muon:
-            trunk_fc.weight
+        For this PQNAtariNetwork, the actual learnable modules are:
 
-          Adam:
-            input_brn params
-            conv weights unless use_muon_input=True
-            output heads unless use_muon_output=True
-            all biases
-            all LayerNorm params
+            input_norm   optional BatchNorm2d
+            conv1        Conv2d(c -> 32)
+            norm1        conv norm
+            conv2        Conv2d(32 -> 64)
+            norm2        conv norm
+            conv3        Conv2d(64 -> 64)
+            norm3        conv norm
+            fc           Linear(3136 -> 512)
+            fc_norm      linear norm
+            q_head       Linear(512 -> action_dim)
+
+        Default Muon routing:
+            Muon:
+                fc.weight
+
+            Adam:
+                all biases
+                all norm params
+                input_norm params
+                conv weights unless use_muon_input=True
+                q_head.weight unless use_muon_output=True
 
         Optional:
-          use_muon_input=True:
-            conv1.weight
-            conv2.weight
-            conv3.weight
+            use_muon_input=True:
+                also route conv2.weight and conv3.weight to Muon
+                conv1.weight stays Adam by default because it is an input layer
 
-          use_muon_output=True:
-            actor_out.weight
-            critic_out.weight
+            use_muon_output=True:
+                also route q_head.weight to Muon
         """
 
         muon_params = [
-            self.actor_fc.weight,
-            self.critic_fc.weight,
-            self.trunk_fc.weight,
+            self.fc.weight,
         ]
 
         if self.use_muon_input:
             muon_params.extend([
-                # self.conv1.weight,
+                # Keep conv1.weight out of Muon by default because it is the input layer.
                 self.conv2.weight,
                 self.conv3.weight,
             ])
 
         if self.use_muon_output:
             muon_params.extend([
-                self.actor_out.weight,
-                self.critic_out.weight,
+                self.q_head.weight,
             ])
 
         muon_ids = {id(p) for p in muon_params}
@@ -832,5 +839,12 @@ class PQNAtariNetwork(nn.Module):
             p for p in self.parameters()
             if id(p) not in muon_ids
         ]
+
+        # Optional sanity checks. These catch duplicated/missing params.
+        adam_ids = {id(p) for p in adam_params}
+        all_ids = {id(p) for p in self.parameters()}
+
+        assert muon_ids.isdisjoint(adam_ids), "Parameter appears in both Muon and Adam groups."
+        assert muon_ids | adam_ids == all_ids, "Some parameters are missing from optimizer groups."
 
         return muon_params, adam_params
