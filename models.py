@@ -394,6 +394,7 @@ class ConvSimpleAgent(nn.Module):
         brn_max_d=5.0,
         brn_warmup_steps=1000,
         brn_smooth=True,
+        norm = True,
     ):
         super().__init__()
 
@@ -697,7 +698,7 @@ class PQNAtariNetwork(nn.Module):
     def __init__(
         self,
         envs,
-        norm_type: NormType = "layer_norm",
+        norm_type: NormType = "none",
         norm_input: bool = False,
         use_muon_input = True,
         use_muon_output = False,
@@ -717,13 +718,22 @@ class PQNAtariNetwork(nn.Module):
         self.input_norm = nn.BatchNorm2d(c) if norm_input else nn.Identity()
 
         self.conv1 = nn.Conv2d(c, 32, kernel_size=8, stride=4, padding=0)
-        self.norm1 = make_conv_norm(norm_type, 32)
+        if norm_type == "LayerNorm":
+            self.norm1 = make_conv_norm(norm_type, 32)
+            self.norm2 = make_conv_norm(norm_type, 64)
+            self.norm3 = make_conv_norm(norm_type, 64)
+        elif norm_type == "batch_norm":
+            self.norm1 = nn.BatchNorm2d(c)
+            self.norm2 = nn.BatchNorm2d(c)
+            self.norm3 = nn.BatchNorm2d(c)
+        else:
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
+            self.norm3 = nn.Identity()
 
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0)
-        self.norm2 = make_conv_norm(norm_type, 64)
 
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0)
-        self.norm3 = make_conv_norm(norm_type, 64)
 
         # For standard Atari 84x84 input:
         # 84 -> conv8/s4 -> 20
