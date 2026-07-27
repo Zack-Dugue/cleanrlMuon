@@ -120,9 +120,9 @@ class Args:
 
 
 class RecordEpisodeStatistics(gym.Wrapper):
-    def __init__(self, env, deque_size=100):
+    def __init__(self, env, num_envs, deque_size=100):
         super().__init__(env)
-        self.num_envs = getattr(env, "num_envs", 1)
+        self.num_envs = int(num_envs)
         self.episode_returns = None
         self.episode_lengths = None
 
@@ -1247,7 +1247,7 @@ if __name__ == "__main__":
     # EnvPool already exposes num_envs as a read-only property.
     envs.single_action_space = envs.action_space
     envs.single_observation_space = envs.observation_space
-    envs = RecordEpisodeStatistics(envs)
+    envs = RecordEpisodeStatistics(envs, args.num_envs)
     print(f"envs.action_space type = {type(envs.action_space)}")
     assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
