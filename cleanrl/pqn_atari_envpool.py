@@ -82,7 +82,7 @@ class Args:
     """True uses a rank-R Nyström Gram; False uses the exact minibatch Gram"""
     nystrom_directions: int = 64
     """number of randomly selected Nyström anchor samples"""
-    nystrom_use_spatial_mean: bool = False
+    nystrom_use_spatial_mean: bool = True
     """True uses the fast spatial-mean Conv2d approximation; False keeps exact spatial covariance"""
     nystrom_use_mean_gradient_nullspace: bool = True
     """restore the ordinary MSE gradient outside the retained Nyström subspace"""
@@ -110,6 +110,13 @@ class Args:
     """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
+
+    @property
+    def __class__(self):
+        return super().__class__
+
+    def __ne__(self, value, /):
+        return super().__ne__(value)
 
 
 class RecordEpisodeStatistics(gym.Wrapper):
