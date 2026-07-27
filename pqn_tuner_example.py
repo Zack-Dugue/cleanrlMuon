@@ -47,7 +47,7 @@ def default_params_fn(
     """
 
     def _fn(trial: optuna.Trial) -> dict:
-        if optimizer_name in ["Muon", "NorMuon", "AdaMuon"]:
+        if optimizer_name in ["Muon", "NorMuon", "AdaMuon", "NystromSGD"]:
             learning_rate = trial.suggest_float("lr", 3e-4, 3e-2, log=True)
         else:
             learning_rate = trial.suggest_float("lr", 3e-5, 3e-3, log=True)
