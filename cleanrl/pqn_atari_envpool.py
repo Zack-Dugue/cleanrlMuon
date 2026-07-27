@@ -94,7 +94,7 @@ class Args:
     """relative spectral threshold used to remove numerical zero directions"""
     nystrom_conv_sample_chunk_size: int = 32
     """sample chunk used for exact per-sample Conv2d Jacobian construction"""
-    nystrom_weight_decay: float = 0.0
+    nystrom_weight_decay: float = 0.0001
     """coupled SGD weight decay used only by NystromSGD"""
     nystrom_log_every: int = 10
     """log Nyström diagnostics every this many optimizer updates"""
