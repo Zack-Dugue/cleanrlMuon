@@ -973,11 +973,15 @@ def assign_nystrom_reconstructed_gradients(
                 gradients * sample_weights[:, None]
             )
 
-            module.weight.grad = (
-                weighted_gradients.T @ activations
-            ).to(dtype=module.weight.dtype)
+            if module.weight.requires_grad:
+                module.weight.grad = (
+                    weighted_gradients.T @ activations
+                ).to(dtype=module.weight.dtype)
 
-            if module.bias is not None:
+            if (
+                module.bias is not None
+                and module.bias.requires_grad
+            ):
                 module.bias.grad = weighted_gradients.sum(
                     dim=0
                 ).to(dtype=module.bias.dtype)
@@ -993,17 +997,21 @@ def assign_nystrom_reconstructed_gradients(
                 )
             )
 
-            module.weight.grad = torch.nn.grad.conv2d_weight(
-                inputs.float(),
-                module.weight.shape,
-                weighted_output_gradients,
-                stride=module.stride,
-                padding=module.padding,
-                dilation=module.dilation,
-                groups=module.groups,
-            ).to(dtype=module.weight.dtype)
+            if module.weight.requires_grad:
+                module.weight.grad = torch.nn.grad.conv2d_weight(
+                    inputs.float(),
+                    module.weight.shape,
+                    weighted_output_gradients,
+                    stride=module.stride,
+                    padding=module.padding,
+                    dilation=module.dilation,
+                    groups=module.groups,
+                ).to(dtype=module.weight.dtype)
 
-            if module.bias is not None:
+            if (
+                module.bias is not None
+                and module.bias.requires_grad
+            ):
                 module.bias.grad = (
                     weighted_output_gradients.sum(
                         dim=(0, 2, 3)
@@ -1048,6 +1056,7 @@ def assign_nystrom_reconstructed_gradients(
             if (
                 module.elementwise_affine
                 and module.weight is not None
+                and module.weight.requires_grad
             ):
                 module.weight.grad = (
                     gradients_float
@@ -1060,6 +1069,7 @@ def assign_nystrom_reconstructed_gradients(
             if (
                 module.elementwise_affine
                 and module.bias is not None
+                and module.bias.requires_grad
             ):
                 module.bias.grad = (
                     gradients_float * weight_view
@@ -1096,20 +1106,28 @@ def nystrom_sgd_step(
         parameter.requires_grad
         for parameter in q_network.parameters()
     ]
-    for parameter in q_network.parameters():
-        parameter.requires_grad_(False)
-
-    geometry_observations = (
-        observations.detach().requires_grad_(True)
-    )
-
-    collector.start(
-        batch_size=minibatch_size,
-        anchor_indices=anchor_indices,
-        device=device,
-    )
+    collector_started = False
 
     try:
+        for parameter in q_network.parameters():
+            parameter.requires_grad_(False)
+
+        # EnvPool Atari observations are normally uint8. Integer tensors cannot
+        # require gradients, so use an equivalent floating-point copy for the
+        # Jacobian-only forward pass. PQNAtariNetwork already treats its input
+        # numerically (normally dividing by 255), so this does not change Q.
+        geometry_observations = observations.detach()
+        if not geometry_observations.is_floating_point():
+            geometry_observations = geometry_observations.float()
+        geometry_observations.requires_grad_(True)
+
+        collector.start(
+            batch_size=minibatch_size,
+            anchor_indices=anchor_indices,
+            device=device,
+        )
+        collector_started = True
+
         q_values = q_network(geometry_observations)
         selected_q = q_values.gather(
             1,
@@ -1123,20 +1141,15 @@ def nystrom_sgd_step(
 
         selected_q.sum().backward()
         cross_matrix, diagonal, factors = collector.finish()
-    except Exception:
-        collector.abort()
+        collector_started = False
+    finally:
+        if collector_started:
+            collector.abort()
         for parameter, requires_grad in zip(
             q_network.parameters(),
             original_requires_grad,
         ):
             parameter.requires_grad_(requires_grad)
-        raise
-
-    for parameter, requires_grad in zip(
-        q_network.parameters(),
-        original_requires_grad,
-    ):
-        parameter.requires_grad_(requires_grad)
 
     sample_weights, diagnostics = (
         compute_nystrom_sample_weights(
@@ -1231,7 +1244,7 @@ if __name__ == "__main__":
         reward_clip=True,
         seed=args.seed,
     )
-    envs.num_envs = args.num_envs
+    # EnvPool already exposes num_envs as a read-only property.
     envs.single_action_space = envs.action_space
     envs.single_observation_space = envs.observation_space
     envs = RecordEpisodeStatistics(envs)
@@ -1280,7 +1293,7 @@ if __name__ == "__main__":
             ),
         )
         if device.type == "cuda":
-            anchor_generator = torch.Generator(device="cuda")
+            anchor_generator = torch.Generator(device=device)
         else:
             anchor_generator = torch.Generator()
         anchor_generator.manual_seed(args.seed + 10_000)
@@ -1529,4 +1542,3 @@ if __name__ == "__main__":
         nystrom_collector.remove()
 
     envs.close()
-    writer.close()
