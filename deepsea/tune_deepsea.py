@@ -88,10 +88,10 @@ def suggest_params(trial, optimizer: str, search_space: str) -> Dict[str, object
         learning_rate = trial.suggest_float("learning_rate", 3.0e-4, 3.0e-2, log=True)
     else:
         learning_rate = trial.suggest_float("learning_rate", 3.0e-5, 3.0e-3, log=True)
-    distance_from_one = trial.suggest_float("distance_from_one", 1.0e-3, 1.0, log=True)
+    distance_from_one = trial.suggest_float("distance_from_one",0,.5)
     result: Dict[str, object] = {
         "learning-rate": learning_rate,
-        "q-lambda": 1.0 - distance_from_one,
+        "q-lambda": 1.0 - distance_from_one**2,
         "start-e": 1.0,
         "end-e": trial.suggest_categorical(
             "end_e", [0.0, 0.001, 0.003, 0.01, 0.03, 0.05]
