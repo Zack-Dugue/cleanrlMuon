@@ -89,12 +89,16 @@ python deepsea/tune_deepsea.py \
   --study-name deepsea_pqn_muon
 ```
 
-The default `core` study tunes learning rate, Q(lambda), and exploration
-duration. `--search-space full` also tunes final epsilon, update epochs, and
-hidden width. The objective is mean normalized greedy return over all requested
-size/seed runs. Return normalization uses the conservative lower bound `-0.01`
-and the size-specific optimal return `1 - 0.01(N-1)/N`, so an optimal run maps
-to one.
+The exploration fraction is fixed at `0.1`: epsilon always anneals over the
+first 10% of training. The default `core` study tunes learning rate, Q(lambda),
+and the minimum/final epsilon over the deliberately constrained set
+`{0, 0.001, 0.003, 0.01, 0.03, 0.05}`. Larger final epsilons are omitted
+because persistent independent action noise rapidly destroys coherent
+right-moving trajectories as DeepSea grows. `--search-space full` additionally
+tunes update epochs and hidden width. The objective is mean normalized greedy
+return over all requested size/seed runs. Return normalization uses the
+conservative lower bound `-0.01` and the size-specific optimal return
+`1 - 0.01(N-1)/N`, so an optimal run maps to one.
 
 Tuning outputs live under `logs/deepsea/tuning/<study-name>/`, including the
 Optuna database, subprocess logs, every run's full local metrics, and
