@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Optimizer-specific Optuna tuning for PyTorch PQN on Craftax symbolic."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, List, Mapping, Sequence
+
+try:
+    from .launch_utils import (
+        Device,
+        normalized_return,
+        parse_devices,
+        parse_envs,
+        run_training,
+        safe_slug,
+        write_json,
+    )
+except ImportError:
+    from launch_utils import (  # type: ignore
+        Device,
+        normalized_return,
+        parse_devices,
+        parse_envs,
+        run_training,
+        safe_slug,
+        write_json,
+    )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TRAINING_SCRIPT = REPO_ROOT / "cleanrl" / "pqn_craftax.py"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--optimizer", choices=("Adam", "Muon"), default="Muon")
+    parser.add_argument("--envs", default="Craftax-Classic-Symbolic-v1")
+    parser.add_argument("--gpus", default="0")
+    parser.add_argument("--trials", type=int, default=30)
+    parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--seed-start", type=int, default=1)
+    parser.add_argument("--study-name", default=None)
+    parser.add_argument("--storage", default=None)
+    parser.add_argument("--logs-root", default="logs/craftax/tuning")
+    parser.add_argument("--sampler-seed", type=int, default=2026)
+    parser.add_argument("--search-space", choices=("core", "full"), default="core")
+    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--num-steps", type=int, default=64)
+    parser.add_argument("--num-minibatches", type=int, default=4)
+    parser.add_argument("--eval-steps", type=int, default=100_000)
+    parser.add_argument("--eval-num-envs", type=int, default=32)
+    parser.add_argument("--cpus-per-run", type=int, default=4)
+    track_group = parser.add_mutually_exclusive_group()
+    track_group.add_argument("--track", dest="track", action="store_true")
+    track_group.add_argument("--no-track", dest="track", action="store_false")
+    parser.set_defaults(track=True)
+    parser.add_argument("--wandb-project-name", default="cleanRL-craftax-pqn-tuning")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+def fixed_params(args: argparse.Namespace) -> Dict[str, object]:
+    return {
+        "total-timesteps": args.total_timesteps,
+        "num-envs": args.num_envs,
+        "num-steps": args.num_steps,
+        "num-minibatches": args.num_minibatches,
+        "eval-steps": args.eval_steps,
+        "eval-num-envs": args.eval_num_envs,
+        "optimizer": args.optimizer,
+        "anneal-lr": True,
+        "exploration-fraction": 0.10,
+        "norm-type": "layernorm",
+        "hidden-layers": 2,
+        "use-muon-input": True,
+        "use-muon-output": False,
+    }
+
+
+def suggest_params(trial, optimizer: str, search_space: str) -> Dict[str, object]:
+    if optimizer == "Muon":
+        learning_rate = trial.suggest_float("learning_rate", 3.0e-4, 3.0e-2, log=True)
+    else:
+        learning_rate = trial.suggest_float("learning_rate", 3.0e-5, 3.0e-3, log=True)
+    distance_from_one = trial.suggest_float("distance_from_one", 0.0, 0.5)
+    result: Dict[str, object] = {
+        "learning-rate": learning_rate,
+        "q-lambda": 1.0 - distance_from_one**2,
+        "start-e": 1.0,
+        "end-e": trial.suggest_categorical(
+            "end_e", [0.0, 0.001, 0.003, 0.01, 0.03, 0.05]
+        ),
+        "update-epochs": 4,
+        "hidden-dim": 256,
+    }
+    if search_space == "full":
+        result.update(
+            {
+                "update-epochs": trial.suggest_categorical("update_epochs", [1, 2, 4]),
+                "hidden-dim": trial.suggest_categorical("hidden_dim", [128, 256, 512]),
+            }
+        )
+    return result
+
+
+def resolve_saved_params(
+    raw_params: Mapping[str, object], optimizer: str, search_space: str
+) -> Dict[str, object]:
+    # Keep this identical to suggest_params. In particular, lambda uses the
+    # square here too, so final evaluation actually reproduces the best trial.
+    distance_from_one = float(raw_params["distance_from_one"])
+    result: Dict[str, object] = {
+        "learning-rate": float(raw_params["learning_rate"]),
+        "q-lambda": 1.0 - distance_from_one**2,
+        "start-e": 1.0,
+        "end-e": float(raw_params["end_e"]),
+        "update-epochs": 4,
+        "hidden-dim": 256,
+    }
+    if search_space == "full":
+        result.update(
+            {
+                "update-epochs": int(raw_params["update_epochs"]),
+                "hidden-dim": int(raw_params["hidden_dim"]),
+            }
+        )
+    return result
+
+
+def distribute(
+    items: Sequence[Dict[str, object]], devices: Sequence[Device]
+) -> Dict[Device, List[Dict[str, object]]]:
+    queues: Dict[Device, List[Dict[str, object]]] = {device: [] for device in devices}
+    for index, item in enumerate(items):
+        queues[devices[index % len(devices)]].append(item)
+    return queues
+
+
+def main() -> None:
+    args = parse_args()
+    envs = parse_envs(args.envs)
+    devices = parse_devices(args.gpus)
+    seeds = list(range(args.seed_start, args.seed_start + args.seeds))
+    study_name = args.study_name or f"craftax_pqn_{args.optimizer.lower()}_{args.search_space}"
+    study_dir = Path(args.logs_root) / safe_slug(study_name)
+    study_dir.mkdir(parents=True, exist_ok=True)
+    common_params = fixed_params(args)
+
+    representative = {
+        "learning-rate": 3.0e-3 if args.optimizer == "Muon" else 3.0e-4,
+        "q-lambda": 0.90,
+        "start-e": 1.0,
+        "end-e": 0.01,
+        "update-epochs": 4,
+        "hidden-dim": 256,
+    }
+    if args.dry_run:
+        for index, (env_id, seed) in enumerate(
+            (env_id, seed) for env_id in envs for seed in seeds
+        ):
+            result = run_training(
+                script=TRAINING_SCRIPT,
+                params={**common_params, **representative},
+                env_id=env_id,
+                seed=seed,
+                device=devices[index % len(devices)],
+                output_dir=study_dir / "dry_run" / f"{safe_slug(env_id)}__seed_{seed}",
+                log_path=study_dir / "dry_run" / f"{safe_slug(env_id)}__seed_{seed}.log",
+                track=args.track,
+                wandb_project_name=args.wandb_project_name,
+                wandb_entity=args.wandb_entity,
+                wandb_group=study_name,
+                cpus_per_run=args.cpus_per_run,
+                dry_run=True,
+            )
+            print(result["command"])
+        return
+
+    try:
+        import optuna
+    except ImportError as error:
+        raise SystemExit("Install the tuner with: pip install -e '.[optuna]'") from error
+
+    storage = args.storage or f"sqlite:///{(study_dir / 'study.db').resolve()}"
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(
+            seed=args.sampler_seed, multivariate=True
+        ),
+        load_if_exists=True,
+    )
+
+    def objective(trial) -> float:
+        tuned_params = suggest_params(trial, args.optimizer, args.search_space)
+        tasks = [
+            {"env_id": env_id, "seed": seed} for env_id in envs for seed in seeds
+        ]
+        queues = distribute(tasks, devices)
+
+        def run_queue(
+            device: Device, queue: Sequence[Dict[str, object]]
+        ) -> List[Dict[str, object]]:
+            results: List[Dict[str, object]] = []
+            for task in queue:
+                env_id = str(task["env_id"])
+                seed = int(task["seed"])
+                run_dir = (
+                    study_dir
+                    / "trials"
+                    / f"trial_{trial.number:04d}"
+                    / f"{safe_slug(env_id)}__seed_{seed}"
+                )
+                results.append(
+                    run_training(
+                        script=TRAINING_SCRIPT,
+                        params={**common_params, **tuned_params},
+                        env_id=env_id,
+                        seed=seed,
+                        device=device,
+                        output_dir=run_dir,
+                        log_path=run_dir.with_suffix(".log"),
+                        track=args.track,
+                        wandb_project_name=args.wandb_project_name,
+                        wandb_entity=args.wandb_entity,
+                        wandb_group=f"{study_name}-trial-{trial.number}",
+                        cpus_per_run=args.cpus_per_run,
+                        dry_run=False,
+                    )
+                )
+            return results
+
+        results: List[Dict[str, object]] = []
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [
+                executor.submit(run_queue, device, queue)
+                for device, queue in queues.items()
+            ]
+            for future in as_completed(futures):
+                results.extend(future.result())
+        trial_dir = study_dir / "trials" / f"trial_{trial.number:04d}"
+        write_json(
+            trial_dir / "trial_results.json",
+            {
+                "trial_number": trial.number,
+                "optimizer": args.optimizer,
+                "params": tuned_params,
+                "results": results,
+            },
+        )
+        failures = [result for result in results if result.get("status") != "ok"]
+        if failures:
+            messages = "\n\n".join(str(result.get("error")) for result in failures)
+            raise RuntimeError(f"{len(failures)} Craftax run(s) failed:\n{messages}")
+        scores = [
+            normalized_return(float(result["eval_greedy_return"]), str(result["env_id"]))
+            for result in results
+        ]
+        trial.set_user_attr("environment_seed_scores", scores)
+        trial.set_user_attr(
+            "mean_raw_greedy_return",
+            float(statistics.mean(float(result["eval_greedy_return"]) for result in results)),
+        )
+        return float(statistics.mean(scores))
+
+    study.optimize(objective, n_trials=args.trials)
+    best_params = resolve_saved_params(
+        study.best_trial.params, args.optimizer, args.search_space
+    )
+    payload = {
+        "algorithm": "discrete_pqn",
+        "environment": "Craftax",
+        "optimizer": args.optimizer,
+        "study_name": study.study_name,
+        "search_space": args.search_space,
+        "envs": envs,
+        "seeds_per_trial": args.seeds,
+        "best_trial_number": study.best_trial.number,
+        "best_value": study.best_value,
+        "best_params": best_params,
+        "optuna_params": dict(study.best_trial.params),
+        "fixed_params": common_params,
+        "objective": "mean normalized greedy return across matched environments and seeds",
+    }
+    output_path = study_dir / "best_hyperparams.json"
+    write_json(output_path, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    print(f"Wrote {output_path}")
+
+
+if __name__ == "__main__":
+    main()
