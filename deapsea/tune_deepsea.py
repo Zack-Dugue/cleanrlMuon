@@ -75,6 +75,7 @@ def fixed_params(args: argparse.Namespace) -> Dict[str, object]:
         "eval-episodes": args.eval_episodes,
         "optimizer": args.optimizer,
         "anneal-lr": True,
+        "exploration-fraction": 0.10,
         "norm-type": "layernorm",
         "hidden-layers": 2,
         "use-muon-input": True,
@@ -91,18 +92,16 @@ def suggest_params(trial, optimizer: str, search_space: str) -> Dict[str, object
     result: Dict[str, object] = {
         "learning-rate": learning_rate,
         "q-lambda": 1.0 - distance_from_one,
-        "exploration-fraction": trial.suggest_float(
-            "exploration_fraction", 0.03, 0.50
-        ),
         "start-e": 1.0,
-        "end-e": 0.01,
+        "end-e": trial.suggest_categorical(
+            "end_e", [0.0, 0.001, 0.003, 0.01, 0.03, 0.05]
+        ),
         "update-epochs": 4,
         "hidden-dim": 256,
     }
     if search_space == "full":
         result.update(
             {
-                "end-e": trial.suggest_float("end_e", 0.0, 0.20),
                 "update-epochs": trial.suggest_categorical("update_epochs", [1, 2, 4]),
                 "hidden-dim": trial.suggest_categorical("hidden_dim", [128, 256, 512]),
             }
@@ -116,16 +115,14 @@ def resolve_saved_params(
     result: Dict[str, object] = {
         "learning-rate": float(raw_params["learning_rate"]),
         "q-lambda": 1.0 - float(raw_params["distance_from_one"]),
-        "exploration-fraction": float(raw_params["exploration_fraction"]),
         "start-e": 1.0,
-        "end-e": 0.01,
+        "end-e": float(raw_params["end_e"]),
         "update-epochs": 4,
         "hidden-dim": 256,
     }
     if search_space == "full":
         result.update(
             {
-                "end-e": float(raw_params["end_e"]),
                 "update-epochs": int(raw_params["update_epochs"]),
                 "hidden-dim": int(raw_params["hidden_dim"]),
             }
@@ -155,7 +152,6 @@ def main() -> None:
     representative = {
         "learning-rate": 3.0e-3 if args.optimizer == "Muon" else 3.0e-4,
         "q-lambda": 0.65,
-        "exploration-fraction": 0.10,
         "start-e": 1.0,
         "end-e": 0.01,
         "update-epochs": 4,
