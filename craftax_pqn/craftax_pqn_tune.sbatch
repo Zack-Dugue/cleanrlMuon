@@ -13,21 +13,22 @@
 set -euo pipefail
 trap 'code=$?; echo "[fatal] exit=${code} line=${LINENO} date=$(date)"; exit "${code}"' ERR
 
-ENVS="Craftax-Classic-Symbolic-v1"
+ENVS="Craftax-Symbolic-v1"
 TRIALS=30
 SEEDS_PER_TRIAL=3
 SEED_START=1
 SEARCH_SPACE="core"
 TOTAL_TIMESTEPS=1000000
-NUM_ENVS=128
-NUM_STEPS=64
+NUM_ENVS=1024
+NUM_STEPS=128
 NUM_MINIBATCHES=4
-EVAL_STEPS=100000
-EVAL_NUM_ENVS=32
+EVAL_STEPS=10000
+EVAL_NUM_ENVS=512
 LOGS_ROOT="logs/craftax/tuning"
-ADAM_STUDY="craftax_pqn_adam"
-MUON_STUDY="craftax_pqn_muon"
+ADAM_STUDY="craftax_pqn_rnn_adam"
+MUON_STUDY="craftax_pqn_rnn_muon"
 CPUS_PER_RUN=8
+CONDA_ENV="RLMuonJax"
 
 TRACK=1
 WANDB_PROJECT="cleanRL-craftax-pqn-tuning"
@@ -38,7 +39,7 @@ module purge
 module load conda
 module load miniforge/24.11.2-1
 source ~/.bashrc
-conda activate RLMuon
+conda activate "${CONDA_ENV}"
 
 export PYTHONUNBUFFERED=1
 export PYTHONIOENCODING=utf-8
@@ -46,16 +47,16 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.35
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 
 mkdir -p "${LOGS_ROOT}" logs/craftax/slurm
 test -f craftax_pqn/tune_craftax.py
 test -f cleanrl/pqn_craftax.py
 
 GPU_COUNT=$(python - <<'PY'
-import torch
-print(torch.cuda.device_count())
+import jax
+print(len(jax.devices("gpu")))
 PY
 )
 if [[ "${GPU_COUNT}" -le 0 ]]; then
@@ -63,8 +64,8 @@ if [[ "${GPU_COUNT}" -le 0 ]]; then
     exit 1
 fi
 GPUS=$(python - <<'PY'
-import torch
-print(",".join(str(index) for index in range(torch.cuda.device_count())))
+import jax
+print(",".join(str(index) for index in range(len(jax.devices("gpu")))))
 PY
 )
 

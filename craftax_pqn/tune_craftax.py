@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optimizer-specific Optuna tuning for PyTorch PQN on Craftax symbolic."""
+"""Optimizer-specific Optuna tuning for Flax PQN on Craftax symbolic."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ TRAINING_SCRIPT = REPO_ROOT / "cleanrl" / "pqn_craftax.py"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--optimizer", choices=("Adam", "Muon"), default="Muon")
-    parser.add_argument("--envs", default="Craftax-Classic-Symbolic-v1")
+    parser.add_argument("--envs", default="Craftax-Symbolic-v1")
     parser.add_argument("--gpus", default="0")
     parser.add_argument("--trials", type=int, default=30)
     parser.add_argument("--seeds", type=int, default=3)
@@ -49,11 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampler-seed", type=int, default=2026)
     parser.add_argument("--search-space", choices=("core", "full"), default="core")
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
-    parser.add_argument("--num-envs", type=int, default=128)
-    parser.add_argument("--num-steps", type=int, default=64)
+    parser.add_argument("--num-envs", type=int, default=1024)
+    parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--num-minibatches", type=int, default=4)
-    parser.add_argument("--eval-steps", type=int, default=100_000)
-    parser.add_argument("--eval-num-envs", type=int, default=32)
+    parser.add_argument("--eval-steps", type=int, default=10_000)
+    parser.add_argument("--eval-num-envs", type=int, default=512)
     parser.add_argument("--cpus-per-run", type=int, default=4)
     track_group = parser.add_mutually_exclusive_group()
     track_group.add_argument("--track", dest="track", action="store_true")
@@ -77,7 +77,19 @@ def fixed_params(args: argparse.Namespace) -> Dict[str, object]:
         "anneal-lr": True,
         "exploration-fraction": 0.10,
         "norm-type": "layernorm",
-        "hidden-layers": 2,
+        "norm-input": True,
+        "add-last-action": True,
+        "batch-renorm-momentum": 0.01,
+        "batch-renorm-eps": 1.0e-5,
+        "batch-renorm-max-r": 3.0,
+        "batch-renorm-max-d": 5.0,
+        "batch-renorm-warmup-steps": 10_000,
+        "batch-renorm-smooth": True,
+        "optimistic-resets": True,
+        "optimistic-reset-ratio": 16,
+        "compile-model": True,
+        "max-grad-norm": 0.5,
+        "hidden-layers": 1,
         "use-muon-input": True,
         "use-muon-output": False,
     }
@@ -88,16 +100,16 @@ def suggest_params(trial, optimizer: str, search_space: str) -> Dict[str, object
         learning_rate = trial.suggest_float("learning_rate", 3.0e-4, 3.0e-2, log=True)
     else:
         learning_rate = trial.suggest_float("learning_rate", 3.0e-5, 3.0e-3, log=True)
-    distance_from_one = trial.suggest_float("distance_from_one", 0.0, 0.5)
+    # Squaring the distance biases samples toward lambda=1 while the full
+    # [0, 1] distance now exposes every possible lambda, including PQN's 0.5.
+    distance_from_one = trial.suggest_float("distance_from_one", 0.0, 1.0)
     result: Dict[str, object] = {
         "learning-rate": learning_rate,
         "q-lambda": 1.0 - distance_from_one**2,
         "start-e": 1.0,
-        "end-e": trial.suggest_categorical(
-            "end_e", [0.0, 0.001, 0.003, 0.01, 0.03, 0.05]
-        ),
+        "end-e": trial.suggest_categorical("end_e", [0.001, 0.003, 0.005, 0.01]),
         "update-epochs": 4,
-        "hidden-dim": 256,
+        "hidden-dim": 512,
     }
     if search_space == "full":
         result.update(
@@ -121,7 +133,7 @@ def resolve_saved_params(
         "start-e": 1.0,
         "end-e": float(raw_params["end_e"]),
         "update-epochs": 4,
-        "hidden-dim": 256,
+        "hidden-dim": 512,
     }
     if search_space == "full":
         result.update(
@@ -147,18 +159,20 @@ def main() -> None:
     envs = parse_envs(args.envs)
     devices = parse_devices(args.gpus)
     seeds = list(range(args.seed_start, args.seed_start + args.seeds))
-    study_name = args.study_name or f"craftax_pqn_{args.optimizer.lower()}_{args.search_space}"
+    study_name = args.study_name or (
+        f"craftax_pqn_rnn_{args.optimizer.lower()}_{args.search_space}"
+    )
     study_dir = Path(args.logs_root) / safe_slug(study_name)
     study_dir.mkdir(parents=True, exist_ok=True)
     common_params = fixed_params(args)
 
     representative = {
         "learning-rate": 3.0e-3 if args.optimizer == "Muon" else 3.0e-4,
-        "q-lambda": 0.90,
+        "q-lambda": 0.50,
         "start-e": 1.0,
-        "end-e": 0.01,
+        "end-e": 0.005,
         "update-epochs": 4,
-        "hidden-dim": 256,
+        "hidden-dim": 512,
     }
     if args.dry_run:
         for index, (env_id, seed) in enumerate(
@@ -171,7 +185,9 @@ def main() -> None:
                 seed=seed,
                 device=devices[index % len(devices)],
                 output_dir=study_dir / "dry_run" / f"{safe_slug(env_id)}__seed_{seed}",
-                log_path=study_dir / "dry_run" / f"{safe_slug(env_id)}__seed_{seed}.log",
+                log_path=study_dir
+                / "dry_run"
+                / f"{safe_slug(env_id)}__seed_{seed}.log",
                 track=args.track,
                 wandb_project_name=args.wandb_project_name,
                 wandb_entity=args.wandb_entity,
@@ -185,24 +201,22 @@ def main() -> None:
     try:
         import optuna
     except ImportError as error:
-        raise SystemExit("Install the tuner with: pip install -e '.[optuna]'") from error
+        raise SystemExit(
+            "Install the tuner with: pip install -e '.[optuna]'"
+        ) from error
 
     storage = args.storage or f"sqlite:///{(study_dir / 'study.db').resolve()}"
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(
-            seed=args.sampler_seed, multivariate=True
-        ),
+        sampler=optuna.samplers.TPESampler(seed=args.sampler_seed, multivariate=True),
         load_if_exists=True,
     )
 
     def objective(trial) -> float:
         tuned_params = suggest_params(trial, args.optimizer, args.search_space)
-        tasks = [
-            {"env_id": env_id, "seed": seed} for env_id in envs for seed in seeds
-        ]
+        tasks = [{"env_id": env_id, "seed": seed} for env_id in envs for seed in seeds]
         queues = distribute(tasks, devices)
 
         def run_queue(
@@ -260,13 +274,19 @@ def main() -> None:
             messages = "\n\n".join(str(result.get("error")) for result in failures)
             raise RuntimeError(f"{len(failures)} Craftax run(s) failed:\n{messages}")
         scores = [
-            normalized_return(float(result["eval_greedy_return"]), str(result["env_id"]))
+            normalized_return(
+                float(result["eval_greedy_return"]), str(result["env_id"])
+            )
             for result in results
         ]
         trial.set_user_attr("environment_seed_scores", scores)
         trial.set_user_attr(
             "mean_raw_greedy_return",
-            float(statistics.mean(float(result["eval_greedy_return"]) for result in results)),
+            float(
+                statistics.mean(
+                    float(result["eval_greedy_return"]) for result in results
+                )
+            ),
         )
         return float(statistics.mean(scores))
 
