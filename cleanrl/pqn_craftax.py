@@ -14,6 +14,7 @@ Adam-versus-Muon experiment and JSON/CSV/W&B launcher contract.
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import os
 import sys
@@ -84,8 +85,8 @@ class Args:
     save_model: bool = False
 
     env_id: str = "Craftax-Symbolic-v1"
-    total_timesteps: int = 1_000_000
-    learning_rate: float = 2.5e-4
+    total_timesteps: int = 1_000_000_000
+    learning_rate: float = 3.0e-4
     num_envs: int = 1024
     num_steps: int = 128
     num_minibatches: int = 4
@@ -124,6 +125,8 @@ class Args:
     eval_steps: int = 10_000
     eval_num_envs: int = 512
     log_interval: int = 1
+    matrix_diagnostics_interval: int = 100
+    matrix_diagnostics_power_iterations: int = 8
     jax_mem_fraction: float = 0.90
 
     batch_size: int = 0
@@ -417,11 +420,12 @@ def make_optimizer(
 ) -> optax.GradientTransformation:
     learning_rate = make_learning_rate(args)
     if args.optimizer.lower() == "adam":
-        optimizer = optax.adam(
+        optimizer = optax.adamw(
             learning_rate=learning_rate,
             b1=args.momentum,
             b2=0.99,
             eps=1.0e-5,
+            weight_decay=args.weight_decay,
         )
     elif args.optimizer.lower() == "muon":
         labels = parameter_labels(
@@ -459,6 +463,118 @@ def make_optimizer(
     else:
         raise ValueError("optimizer must be Adam or Muon")
     return optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optimizer)
+
+
+def _find_muon_state(value: Any) -> RLMuonState:
+    """Find the custom Muon state inside Optax chain/masking containers."""
+    if isinstance(value, RLMuonState):
+        return value
+    if isinstance(value, Mapping):
+        children = value.values()
+    elif isinstance(value, (tuple, list)):
+        children = value
+    else:
+        children = ()
+    matches = []
+    for child in children:
+        try:
+            matches.append(_find_muon_state(child))
+        except LookupError:
+            pass
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError("More than one RLMuonState was found in the Optax state")
+    raise LookupError("RLMuonState was not found in the Optax state")
+
+
+def _matrix_slug(path: Tuple[str, ...]) -> str:
+    return ".".join(str(part) for part in path)
+
+
+def _stable_rank_statistics(
+    matrix: jax.Array, *, power_iterations: int
+) -> Dict[str, jax.Array]:
+    """Cheap scale-invariant stable-rank estimate without an SVD.
+
+    Power iteration is applied implicitly to the smaller-side Gram matrix, so
+    this never materializes the large observation-encoder Gram. The estimate
+    is clipped to the mathematically valid [0, min(m, n)] interval.
+    """
+    value = matrix.astype(jnp.float32)
+    rows, columns = value.shape
+    rank_limit = float(min(rows, columns))
+    frobenius_squared = jnp.sum(jnp.square(value))
+    frobenius_norm = jnp.sqrt(frobenius_squared)
+    safe_frobenius = jnp.maximum(frobenius_norm, 1.0e-15)
+    normalized = value / safe_frobenius
+    probe_size = min(rows, columns)
+    probe = jnp.sin(jnp.arange(1, probe_size + 1, dtype=jnp.float32))
+    probe = probe / jnp.maximum(jnp.linalg.norm(probe), 1.0e-12)
+
+    def gram_product(vector: jax.Array) -> jax.Array:
+        if rows <= columns:
+            return normalized @ (normalized.T @ vector)
+        return normalized.T @ (normalized @ vector)
+
+    def power_step(_: int, vector: jax.Array) -> jax.Array:
+        product = gram_product(vector)
+        return product / jnp.maximum(jnp.linalg.norm(product), 1.0e-12)
+
+    probe = jax.lax.fori_loop(0, power_iterations, power_step, probe)
+    largest_normalized_eigenvalue = jnp.maximum(
+        jnp.vdot(probe, gram_product(probe)).real, 1.0e-12
+    )
+    stable_rank = jnp.where(
+        frobenius_squared > 0.0,
+        jnp.clip(1.0 / largest_normalized_eigenvalue, 0.0, rank_limit),
+        0.0,
+    )
+    return {
+        "stable_rank": stable_rank,
+        "stable_rank_fraction": stable_rank / rank_limit,
+        "frobenius_norm": frobenius_norm,
+        "spectral_norm_estimate": jnp.sqrt(
+            largest_normalized_eigenvalue * frobenius_squared
+        ),
+        "rms": jnp.sqrt(frobenius_squared / float(matrix.size)),
+        "max_abs": jnp.max(jnp.abs(value)),
+    }
+
+
+def _matrix_diagnostics(
+    matrices: Mapping[Tuple[str, ...], jax.Array],
+    *,
+    prefix: str,
+    power_iterations: int,
+    include_scale: bool,
+) -> Dict[str, jax.Array]:
+    diagnostics: Dict[str, jax.Array] = {}
+    for path, matrix in matrices.items():
+        if getattr(matrix, "ndim", 0) != 2:
+            continue
+        statistics = _stable_rank_statistics(
+            matrix, power_iterations=power_iterations
+        )
+        name = _matrix_slug(path)
+        diagnostics[f"diagnostics/{prefix}/{name}/stable_rank"] = statistics[
+            "stable_rank"
+        ]
+        diagnostics[f"diagnostics/{prefix}/{name}/stable_rank_fraction"] = (
+            statistics["stable_rank_fraction"]
+        )
+        diagnostics[f"diagnostics/{prefix}/{name}/frobenius_norm"] = statistics[
+            "frobenius_norm"
+        ]
+        diagnostics[f"diagnostics/{prefix}/{name}/spectral_norm_estimate"] = (
+            statistics["spectral_norm_estimate"]
+        )
+        if include_scale:
+            diagnostics[f"diagnostics/{prefix}/{name}/rms"] = statistics["rms"]
+            diagnostics[f"diagnostics/{prefix}/{name}/max_abs"] = statistics[
+                "max_abs"
+            ]
+    return diagnostics
 
 
 class TrainState(train_state.TrainState):
@@ -587,6 +703,50 @@ def make_train_function(
     learning_rate = make_learning_rate(args)
 
     def train(initial_train_state: TrainState, rng: jax.Array):
+        initial_flat_params = traverse_util.flatten_dict(initial_train_state.params)
+        matrix_paths = tuple(
+            path for path, value in initial_flat_params.items() if value.ndim == 2
+        )
+        flat_muon_labels = traverse_util.flatten_dict(
+            parameter_labels(
+                initial_train_state.params,
+                use_muon_input=args.use_muon_input,
+                use_muon_output=args.use_muon_output,
+            )
+        )
+        muon_matrix_paths = tuple(
+            path for path in matrix_paths if flat_muon_labels[path] == "muon"
+        )
+
+        diagnostic_keys = []
+        for prefix, paths, include_scale in (
+            ("weights", matrix_paths, True),
+            ("raw_gradient", matrix_paths, False),
+            (
+                "pre_ns_momentum",
+                muon_matrix_paths if args.optimizer.lower() == "muon" else (),
+                False,
+            ),
+        ):
+            for path in paths:
+                name = _matrix_slug(path)
+                diagnostic_keys.extend(
+                    (
+                        f"diagnostics/{prefix}/{name}/stable_rank",
+                        f"diagnostics/{prefix}/{name}/stable_rank_fraction",
+                        f"diagnostics/{prefix}/{name}/frobenius_norm",
+                        f"diagnostics/{prefix}/{name}/spectral_norm_estimate",
+                    )
+                )
+                if include_scale:
+                    diagnostic_keys.extend(
+                        (
+                            f"diagnostics/{prefix}/{name}/rms",
+                            f"diagnostics/{prefix}/{name}/max_abs",
+                        )
+                    )
+        diagnostic_keys = tuple(diagnostic_keys)
+
         rng, reset_key = jax.random.split(rng)
         observation, env_state = env_reset(reset_key)
         rollout_state = (
@@ -603,6 +763,13 @@ def make_train_function(
             train_state_value, rollout_state_value, update_rng = runner
             epsilon = epsilon_schedule(update_index)
             initial_carry = rollout_state_value[0]
+            diagnostics_due = jnp.logical_or(
+                jnp.logical_or(
+                    update_index == 0,
+                    (update_index + 1) % args.matrix_diagnostics_interval == 0,
+                ),
+                update_index == args.num_iterations - 1,
+            )
 
             def environment_step(state: Tuple[Any, ...], _: None):
                 (
@@ -681,9 +848,14 @@ def make_train_function(
 
             def learn_minibatch(
                 current_train_state: TrainState,
-                minibatch: Tuple[Any, Transition],
+                minibatch: Tuple[jax.Array, jax.Array, Any, Transition],
             ):
-                minibatch_carry, minibatch_transition = minibatch
+                (
+                    epoch_index,
+                    minibatch_index,
+                    minibatch_carry,
+                    minibatch_transition,
+                ) = minibatch
 
                 def loss_fn(params: Any):
                     (unused_carry, q_values), updates = network.apply(
@@ -712,23 +884,130 @@ def make_train_function(
                         minibatch_transition.action[:-1, :, None],
                         axis=-1,
                     ).squeeze(-1)
-                    loss = 0.5 * jnp.mean(jnp.square(selected_q - targets))
-                    return loss, (updates["batch_stats"], jnp.mean(selected_q))
+                    td_error = selected_q - targets
+                    loss = 0.5 * jnp.mean(jnp.square(td_error))
+                    return loss, (
+                        updates["batch_stats"],
+                        jnp.mean(selected_q),
+                        jnp.mean(jnp.abs(q_values)),
+                        jnp.max(jnp.abs(q_values)),
+                        jnp.mean(targets),
+                        jnp.mean(jnp.abs(targets)),
+                        jnp.max(jnp.abs(targets)),
+                        jnp.mean(jnp.abs(td_error)),
+                        jnp.max(jnp.abs(td_error)),
+                    )
 
-                (loss, (batch_stats, q_mean)), gradients = jax.value_and_grad(
-                    loss_fn, has_aux=True
-                )(current_train_state.params)
+                (
+                    loss,
+                    (
+                        batch_stats,
+                        q_mean,
+                        q_abs_mean,
+                        q_abs_max,
+                        target_mean,
+                        target_abs_mean,
+                        target_abs_max,
+                        td_error_abs_mean,
+                        td_error_abs_max,
+                    ),
+                ), gradients = jax.value_and_grad(loss_fn, has_aux=True)(
+                    current_train_state.params
+                )
                 grad_norm = optax.global_norm(gradients)
+                old_opt_state = current_train_state.opt_state
                 current_train_state = current_train_state.apply_gradients(
                     grads=gradients, batch_stats=batch_stats
                 )
-                return current_train_state, {
+
+                collect_diagnostics = jnp.logical_and(
+                    diagnostics_due,
+                    jnp.logical_and(
+                        minibatch_index == args.num_minibatches - 1,
+                        epoch_index == args.update_epochs - 1,
+                    ),
+                )
+
+                def calculate_diagnostics(_: None) -> Dict[str, jax.Array]:
+                    flat_params = traverse_util.flatten_dict(
+                        current_train_state.params
+                    )
+                    flat_gradients = traverse_util.flatten_dict(gradients)
+                    result = _matrix_diagnostics(
+                        {path: flat_params[path] for path in matrix_paths},
+                        prefix="weights",
+                        power_iterations=args.matrix_diagnostics_power_iterations,
+                        include_scale=True,
+                    )
+                    result.update(
+                        _matrix_diagnostics(
+                            {path: flat_gradients[path] for path in matrix_paths},
+                            prefix="raw_gradient",
+                            power_iterations=args.matrix_diagnostics_power_iterations,
+                            include_scale=False,
+                        )
+                    )
+                    if args.optimizer.lower() == "muon":
+                        old_muon_state = _find_muon_state(old_opt_state)
+                        flat_momentum = traverse_util.flatten_dict(
+                            old_muon_state.momentum
+                        )
+                        clip_scale = jnp.minimum(
+                            1.0,
+                            args.max_grad_norm / jnp.maximum(grad_norm, 1.0e-12),
+                        )
+                        pre_ns_directions = {}
+                        for path in muon_matrix_paths:
+                            clipped_gradient = flat_gradients[path] * clip_scale
+                            new_momentum = (
+                                args.momentum * flat_momentum[path]
+                                + (1.0 - args.momentum) * clipped_gradient
+                            )
+                            pre_ns_directions[path] = (
+                                (1.0 - args.momentum) * clipped_gradient
+                                + args.momentum * new_momentum
+                            )
+                        result.update(
+                            _matrix_diagnostics(
+                                pre_ns_directions,
+                                prefix="pre_ns_momentum",
+                                power_iterations=(
+                                    args.matrix_diagnostics_power_iterations
+                                ),
+                                include_scale=False,
+                            )
+                        )
+                    return result
+
+                diagnostics = jax.lax.cond(
+                    collect_diagnostics,
+                    calculate_diagnostics,
+                    lambda _: {
+                        key: jnp.zeros((), jnp.float32) for key in diagnostic_keys
+                    },
+                    operand=None,
+                )
+                minibatch_metrics = {
                     "td_loss": loss,
                     "q_value_mean": q_mean,
+                    "q_value_abs_mean": q_abs_mean,
+                    "q_value_abs_max": q_abs_max,
+                    "target_mean": target_mean,
+                    "target_abs_mean": target_abs_mean,
+                    "target_abs_max": target_abs_max,
+                    "td_error_abs_mean": td_error_abs_mean,
+                    "td_error_abs_max": td_error_abs_max,
                     "grad_norm": grad_norm,
+                    "grad_clipped": (grad_norm > args.max_grad_norm).astype(
+                        jnp.float32
+                    ),
                 }
+                minibatch_metrics.update(diagnostics)
+                return current_train_state, minibatch_metrics
 
-            def learn_epoch(epoch_state: Tuple[TrainState, jax.Array], _: None):
+            def learn_epoch(
+                epoch_state: Tuple[TrainState, jax.Array], epoch_index: jax.Array
+            ):
                 current_train_state, epoch_rng = epoch_state
                 epoch_rng, permutation_key = jax.random.split(epoch_rng)
                 permutation = jax.random.permutation(permutation_key, args.num_envs)
@@ -759,7 +1038,14 @@ def make_train_function(
                 current_train_state, minibatch_metrics = jax.lax.scan(
                     learn_minibatch,
                     current_train_state,
-                    (minibatch_carries, minibatch_transitions),
+                    (
+                        jnp.full(
+                            (args.num_minibatches,), epoch_index, dtype=jnp.int32
+                        ),
+                        jnp.arange(args.num_minibatches, dtype=jnp.int32),
+                        minibatch_carries,
+                        minibatch_transitions,
+                    ),
                 )
                 return (
                     current_train_state,
@@ -770,13 +1056,29 @@ def make_train_function(
             (train_state_value, _), learning_metrics = jax.lax.scan(
                 learn_epoch,
                 (train_state_value, learning_rng),
-                None,
-                length=args.update_epochs,
+                jnp.arange(args.update_epochs, dtype=jnp.int32),
             )
             metric = {
                 "td_loss": jnp.mean(learning_metrics["td_loss"]),
                 "q_value_mean": jnp.mean(learning_metrics["q_value_mean"]),
+                "q_value_abs_mean": jnp.mean(
+                    learning_metrics["q_value_abs_mean"]
+                ),
+                "q_value_abs_max": jnp.max(learning_metrics["q_value_abs_max"]),
+                "target_mean": jnp.mean(learning_metrics["target_mean"]),
+                "target_abs_mean": jnp.mean(
+                    learning_metrics["target_abs_mean"]
+                ),
+                "target_abs_max": jnp.max(learning_metrics["target_abs_max"]),
+                "td_error_abs_mean": jnp.mean(
+                    learning_metrics["td_error_abs_mean"]
+                ),
+                "td_error_abs_max": jnp.max(
+                    learning_metrics["td_error_abs_max"]
+                ),
                 "grad_norm": jnp.mean(learning_metrics["grad_norm"]),
+                "grad_norm_max": jnp.max(learning_metrics["grad_norm"]),
+                "grad_clip_fraction": jnp.mean(learning_metrics["grad_clipped"]),
                 "episode_return_sum": jnp.sum(events.episode_return),
                 "episode_length_sum": jnp.sum(events.episode_length),
                 "episode_count": jnp.sum(events.returned_episode),
@@ -787,6 +1089,35 @@ def make_train_function(
                     else jnp.asarray(learning_rate)
                 ),
             }
+            for key in diagnostic_keys:
+                metric[key] = jnp.where(
+                    diagnostics_due,
+                    jnp.sum(learning_metrics[key]),
+                    jnp.asarray(jnp.nan, jnp.float32),
+                )
+            renorm_stats = train_state_value.batch_stats["input_renorm"]
+            metric.update(
+                {
+                    "diagnostics/batch_renorm/count": renorm_stats["count"],
+                    "diagnostics/batch_renorm/ramp_fraction": jnp.minimum(
+                        renorm_stats["count"].astype(jnp.float32)
+                        / max(args.batch_renorm_warmup_steps, 1),
+                        1.0,
+                    ),
+                    "diagnostics/batch_renorm/running_mean_rms": jnp.sqrt(
+                        jnp.mean(jnp.square(renorm_stats["mean"]))
+                    ),
+                    "diagnostics/batch_renorm/running_var_mean": jnp.mean(
+                        renorm_stats["var"]
+                    ),
+                    "diagnostics/batch_renorm/running_var_min": jnp.min(
+                        renorm_stats["var"]
+                    ),
+                    "diagnostics/batch_renorm/running_var_max": jnp.max(
+                        renorm_stats["var"]
+                    ),
+                }
+            )
             return (
                 train_state_value,
                 rollout_state_value,
@@ -954,6 +1285,12 @@ def validate_args(args: Args) -> None:
         raise ValueError("jax_mem_fraction must be in (0, 1]")
     if args.log_interval < 1:
         raise ValueError("log_interval must be positive")
+    if args.matrix_diagnostics_interval < 1:
+        raise ValueError("matrix_diagnostics_interval must be positive")
+    if args.matrix_diagnostics_power_iterations < 1:
+        raise ValueError("matrix_diagnostics_power_iterations must be positive")
+    if args.weight_decay < 0.0:
+        raise ValueError("weight_decay cannot be negative")
 
 
 def write_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -984,6 +1321,11 @@ def _recent_weighted_mean(
 def main() -> None:
     args = tyro.cli(Args)
     validate_args(args)
+    if args.track and importlib.util.find_spec("wandb") is None:
+        raise RuntimeError(
+            "W&B tracking was requested but wandb is not installed; install the "
+            "Craftax requirements or pass --no-track."
+        )
     backend = jax.default_backend()
     requested_cpu = not args.cuda or (args.device or "").lower() == "cpu"
     if requested_cpu and backend != "cpu":
@@ -1098,31 +1440,17 @@ def main() -> None:
             "parameter_count": parameter_count,
             "muon_parameter_count": muon_parameter_count,
             "actual_total_timesteps": args.num_iterations * args.batch_size,
+            "total_optimizer_steps": (
+                args.num_iterations * args.update_epochs * args.num_minibatches
+            ),
+            "batch_renorm_warmup_fraction": args.batch_renorm_warmup_steps
+            / max(
+                args.num_iterations * args.update_epochs * args.num_minibatches,
+                1,
+            ),
         }
     )
     write_json(output_dir / "config.json", config)
-
-    wandb_run = None
-    if args.track:
-        import wandb
-
-        wandb_run = wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            group=args.wandb_group,
-            tags=[args.wandb_tag] if args.wandb_tag else None,
-            config=config,
-            name=run_name,
-            dir=str(output_dir),
-            save_code=True,
-        )
-
-    writer = SummaryWriter(str(output_dir / "tensorboard"))
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n"
-        + "\n".join(f"|{key}|{value}|" for key, value in config.items()),
-    )
 
     train_function = make_train_function(
         args, network, train_reset, train_step, action_dim
@@ -1185,6 +1513,12 @@ def main() -> None:
         key: np.asarray(value)
         for key, value in jax.device_get(training_metrics).items()
     }
+    writer = SummaryWriter(str(output_dir / "tensorboard"))
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n"
+        + "\n".join(f"|{key}|{value}|" for key, value in config.items()),
+    )
     progress_fields = [
         "global_step",
         "iteration",
@@ -1195,9 +1529,23 @@ def main() -> None:
         "episode_count",
         "td_loss",
         "q_value_mean",
+        "q_value_abs_mean",
+        "q_value_abs_max",
+        "target_mean",
+        "target_abs_mean",
+        "target_abs_max",
+        "td_error_abs_mean",
+        "td_error_abs_max",
         "grad_norm",
+        "grad_norm_max",
+        "grad_clip_fraction",
         "sps",
     ]
+    diagnostic_fields = sorted(
+        key for key in metrics if key.startswith("diagnostics/")
+    )
+    progress_fields.extend(diagnostic_fields)
+    wandb_records = []
     progress_path = output_dir / "progress.csv"
     with progress_path.open("w", newline="", encoding="utf-8") as handle:
         progress_writer = csv.DictWriter(handle, fieldnames=progress_fields)
@@ -1228,9 +1576,24 @@ def main() -> None:
                 "episode_count": int(episode_count),
                 "td_loss": float(metrics["td_loss"][index]),
                 "q_value_mean": float(metrics["q_value_mean"][index]),
+                "q_value_abs_mean": float(metrics["q_value_abs_mean"][index]),
+                "q_value_abs_max": float(metrics["q_value_abs_max"][index]),
+                "target_mean": float(metrics["target_mean"][index]),
+                "target_abs_mean": float(metrics["target_abs_mean"][index]),
+                "target_abs_max": float(metrics["target_abs_max"][index]),
+                "td_error_abs_mean": float(
+                    metrics["td_error_abs_mean"][index]
+                ),
+                "td_error_abs_max": float(metrics["td_error_abs_max"][index]),
                 "grad_norm": float(metrics["grad_norm"][index]),
+                "grad_norm_max": float(metrics["grad_norm_max"][index]),
+                "grad_clip_fraction": float(
+                    metrics["grad_clip_fraction"][index]
+                ),
                 "sps": training_sps,
             }
+            for key in diagnostic_fields:
+                row[key] = float(metrics[key][index])
             progress_writer.writerow(row)
             logged = {
                 "charts/epsilon": row["epsilon"],
@@ -1238,8 +1601,24 @@ def main() -> None:
                 "charts/SPS": training_sps,
                 "losses/td_loss": row["td_loss"],
                 "losses/q_values": row["q_value_mean"],
+                "losses/q_values_abs_mean": row["q_value_abs_mean"],
+                "losses/q_values_abs_max": row["q_value_abs_max"],
+                "losses/targets": row["target_mean"],
+                "losses/targets_abs_mean": row["target_abs_mean"],
+                "losses/targets_abs_max": row["target_abs_max"],
+                "losses/td_error_abs_mean": row["td_error_abs_mean"],
+                "losses/td_error_abs_max": row["td_error_abs_max"],
                 "losses/grad_norm": row["grad_norm"],
+                "losses/grad_norm_max": row["grad_norm_max"],
+                "losses/grad_clip_fraction": row["grad_clip_fraction"],
             }
+            logged.update(
+                {
+                    key: row[key]
+                    for key in diagnostic_fields
+                    if np.isfinite(row[key])
+                }
+            )
             if episode_count > 0:
                 logged.update(
                     {
@@ -1249,8 +1628,7 @@ def main() -> None:
                 )
             for key, value in logged.items():
                 writer.add_scalar(key, value, global_step)
-            if wandb_run is not None:
-                wandb_run.log(logged, step=global_step)
+            wandb_records.append((global_step, logged))
 
     training_recent_return = _recent_weighted_mean(
         metrics["episode_return_sum"], metrics["episode_count"]
@@ -1264,6 +1642,11 @@ def main() -> None:
         + evaluation_compile_seconds
         + evaluation_elapsed
     )
+    final_diagnostics = {
+        key: float(metrics[key][-1])
+        for key in diagnostic_fields
+        if np.isfinite(float(metrics[key][-1]))
+    }
     summary: Dict[str, object] = {
         "status": "ok",
         "algorithm": "discrete_pqn",
@@ -1281,10 +1664,10 @@ def main() -> None:
         "sps": training_sps,
         "training_recent_return": training_recent_return,
         "training_recent_length": training_recent_length,
+        "final_diagnostics": final_diagnostics,
         "config": config,
         **evaluation,
     }
-    write_json(output_dir / "summary.json", summary)
     if args.save_model:
         model_bytes = serialization.to_bytes(
             {
@@ -1296,24 +1679,70 @@ def main() -> None:
 
     evaluation_logs = {
         "evaluation/greedy_return": evaluation["eval_greedy_return"],
+        "evaluation/greedy_return_std": evaluation["eval_greedy_return_std"],
         "evaluation/reward_per_1000_steps": evaluation["eval_reward_per_1000_steps"],
         "evaluation/episodes": evaluation["eval_episodes"],
+        "evaluation/mean_episode_length": evaluation[
+            "eval_mean_episode_length"
+        ],
+        "evaluation/partial_return_fallback": evaluation[
+            "eval_partial_return_fallback"
+        ],
+        "evaluation/elapsed_seconds": evaluation_elapsed,
         "evaluation/SPS": evaluation["eval_sps"],
     }
     for key, value in evaluation_logs.items():
         writer.add_scalar(key, value, int(config["actual_total_timesteps"]))
     writer.close()
-    if wandb_run is not None:
-        wandb_run.log(evaluation_logs, step=int(config["actual_total_timesteps"]))
+
+    wandb_run = None
+    if args.track:
+        # Deliberately initialize W&B only after both compiled executables have
+        # finished. This keeps networking and W&B bookkeeping entirely outside
+        # the measured training/evaluation path while still uploading the full
+        # buffered trajectory for every completed seed.
+        import wandb
+
+        wandb_run = wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            group=args.wandb_group,
+            tags=[args.wandb_tag] if args.wandb_tag else None,
+            config=config,
+            name=run_name,
+            dir=str(output_dir),
+            save_code=True,
+        )
+        if wandb_records and wandb_records[-1][0] == int(
+            config["actual_total_timesteps"]
+        ):
+            wandb_records[-1][1].update(evaluation_logs)
+        else:
+            wandb_records.append(
+                (int(config["actual_total_timesteps"]), evaluation_logs)
+            )
+        for global_step, logged in wandb_records:
+            wandb_run.log(logged, step=global_step)
         wandb_run.summary.update(
             {
                 "eval_greedy_return": evaluation["eval_greedy_return"],
                 "eval_reward_per_1000_steps": evaluation["eval_reward_per_1000_steps"],
                 "eval_episodes": evaluation["eval_episodes"],
+                "eval_greedy_return_std": evaluation["eval_greedy_return_std"],
+                "eval_mean_episode_length": evaluation[
+                    "eval_mean_episode_length"
+                ],
                 "sps": training_sps,
+                **final_diagnostics,
             }
         )
+        summary["wandb_run_id"] = wandb_run.id
+        summary["wandb_run_url"] = getattr(wandb_run, "url", None)
         wandb_run.finish()
+        summary["wandb_uploaded"] = True
+    else:
+        summary["wandb_uploaded"] = False
+    write_json(output_dir / "summary.json", summary)
     print(
         f"completed step={config['actual_total_timesteps']:,} "
         f"optimizer={args.optimizer} SPS={training_sps:,} "

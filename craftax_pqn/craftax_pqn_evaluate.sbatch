@@ -3,12 +3,12 @@
 #SBATCH --partition=batch
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
+#SBATCH --cpus-per-task=64
 #SBATCH --gpus=8
-#SBATCH --time=48:00:00
+#SBATCH --time=36:00:00
 #SBATCH --output=logs/craftax/slurm/%x-%j.out
 #SBATCH --error=logs/craftax/slurm/%x-%j.err
-#SBATCH --account=aalaeddini_391_0001
+#SBATCH --account=aalaeddini_391_0003
 
 set -euo pipefail
 trap 'code=$?; echo "[fatal] exit=${code} line=${LINENO} date=$(date)"; exit "${code}"' ERR
@@ -16,18 +16,21 @@ trap 'code=$?; echo "[fatal] exit=${code} line=${LINENO} date=$(date)"; exit "${
 ENVS="Craftax-Symbolic-v1"
 NUM_SEEDS=10
 SEED_START=101
-TOTAL_TIMESTEPS=1000000
+TOTAL_TIMESTEPS=1000000000
 EVAL_STEPS=10000
 EVAL_NUM_ENVS=512
-OUTPUT_ROOT="logs/craftax/evaluation"
+WEIGHT_DECAY=0.0001
+MATRIX_DIAGNOSTICS_INTERVAL=100
+MATRIX_DIAGNOSTICS_POWER_ITERATIONS=8
+OUTPUT_ROOT="logs/craftax/evaluation_1b"
 LOGS_ROOT="logs/craftax/tuning"
 ADAM_STUDY="craftax_pqn_rnn_adam"
 MUON_STUDY="craftax_pqn_rnn_muon"
 CPUS_PER_RUN=8
-CONDA_ENV="RLMuonJax"
+CONDA_ENV="RLMuonJAX"
 
 TRACK=1
-WANDB_PROJECT="cleanRL-craftax-pqn-evaluation"
+WANDB_PROJECT="cleanRL-craftax-pqn-1b"
 WANDB_ENTITY=""
 WANDB_GROUP="craftax-pqn-final-evaluation"
 
@@ -81,7 +84,7 @@ if [[ "${TRACK}" == "1" ]]; then
 fi
 
 srun python -u craftax_pqn/evaluate_craftax.py \
-    --configs "${ADAM_CONFIG}" "${MUON_CONFIG}" \
+    --configs "${MUON_CONFIG}" "${ADAM_CONFIG}" \
     --envs "${ENVS}" \
     --gpus "${GPUS}" \
     --num-seeds "${NUM_SEEDS}" \
@@ -90,6 +93,11 @@ srun python -u craftax_pqn/evaluate_craftax.py \
     --total-timesteps "${TOTAL_TIMESTEPS}" \
     --eval-steps "${EVAL_STEPS}" \
     --eval-num-envs "${EVAL_NUM_ENVS}" \
+    --weight-decay "${WEIGHT_DECAY}" \
+    --matrix-diagnostics-interval "${MATRIX_DIAGNOSTICS_INTERVAL}" \
+    --matrix-diagnostics-power-iterations "${MATRIX_DIAGNOSTICS_POWER_ITERATIONS}" \
+    --scale-batch-renorm-warmup \
+    --sequential-configs \
     --cpus-per-run "${CPUS_PER_RUN}" \
     "${TRACK_ARGS[@]}"
 
@@ -97,4 +105,5 @@ test -f "${OUTPUT_ROOT}/run_results.csv"
 test -f "${OUTPUT_ROOT}/environment_summary.csv"
 test -f "${OUTPUT_ROOT}/overall_summary.csv"
 test -f "${OUTPUT_ROOT}/paired_deltas.csv"
+test -f "${OUTPUT_ROOT}/resolved_configs.json"
 echo "[info] Craftax evaluation complete at $(date)"
